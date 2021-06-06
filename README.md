@@ -1,5 +1,5 @@
-# This repository is for [Extractive Research Slide Generation Using Windowed Labeling Ranking](https://www.aclweb.org/anthology/2021.sdp-1.11/) article published at the
-Scientific Scholarly Processing (SDP) workshop.
+# [Extractive Research Slide Generation Using Windowed Labeling Ranking](https://www.aclweb.org/anthology/2021.sdp-1.11/)
+This article is published at the Scientific Scholarly Processing (SDP) 2021 workshop.
 # Preprocess data
 1. Dowload the paper and slides from [here](https://drive.google.com/file/d/1xYHXYoQBa7DJVrq0ePly58ioq2EmmVG8/view).
 2. data dir structure:
