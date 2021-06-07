@@ -1,11 +1,10 @@
 import sys
 import time
-import numpy as np
 from batch_data_utils import *
 from batch_model import SummaRuNNer
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 np.set_printoptions(threshold=sys.maxsize)
-
 # Parameters
 # ==================================================
 tf.flags.DEFINE_integer("num_epochs", 300, "Number of training epochs (default: 200)")
@@ -16,11 +15,11 @@ tf.flags.DEFINE_boolean("allow_soft_placement", True, "Allow device soft device 
 tf.flags.DEFINE_boolean("log_device_placement", False, "Log placement of ops on devices")
 
 FLAGS = tf.flags.FLAGS
-vocab = Vocab(params.max_vocab_size, emb_dim=50, dataset_path='../data/',
-              glove_path='../slide_generator_data/glove.6B/glove.6B.50d.txt',
-              vocab_path='../data_files/vocab.txt', lookup_path='../data_files/lookup.pkl')
+vocab = Vocab(params.max_vocab_size, emb_dim=50, dataset_path='data/',
+              glove_path='glove/glove.6B.50d.txt',
+              vocab_path='data_files/vocab.txt', lookup_path='data_files/lookup.pkl')
 
-dg = DataGenerator('../data/', params.max_inp_seq_len, params.max_out_seq_len, vocab, use_pgen=False,
+dg = DataGenerator('data/', params.max_inp_seq_len, params.max_out_seq_len, vocab, use_pgen=False,
                    use_sample=False)
 current_time = str(time.time())
 log_dir = 'logs/' + current_time
@@ -40,6 +39,7 @@ def train():
             streaming_loss, streaming_loss_update = tf.contrib.metrics.streaming_mean(Summa.loss)
             streaming_loss_scalar = tf.summary.scalar('validation_loss', streaming_loss)
 
+            global_step = tf.Variable(0, name="global_step", trainable=False)
             train_params = tf.compat.v1.trainable_variables()
             train_op = tf.compat.v1.train.AdadeltaOptimizer(learning_rate=0.1).minimize(Summa.loss,
                                                                                         var_list=train_params)
@@ -56,16 +56,16 @@ def train():
             sess.run(tf.compat.v1.global_variables_initializer())
             sess.run(tf.local_variables_initializer())
             min_eval_loss = float('Inf')
+            min_train_loss = float('Inf')
             val_step = 0
             step = 0
             for epoch in range(FLAGS.num_epochs):
                 while True:
-                    (enc_in, dec_in, features) = dg.get_batch()
+                    (enc_in, dec_in) = dg.get_batch()
                     step += 1
                     feed_dict = {
                         Summa.x: enc_in,
                         Summa.y: dec_in,
-                        Summa.feats: features
                     }
                     if enc_in.shape[0] != params.batch_size:
                         break
@@ -80,19 +80,18 @@ def train():
                     if step % FLAGS.checkpoint_every == 0 and step != 0:  # fix
                         eval_loss = 0
                         val_step += 1
-                        val_dg = DataGenerator('../data_and_utils/data/', params.max_inp_seq_len,
+                        val_dg = DataGenerator('data/', params.max_inp_seq_len,
                                                params.max_out_seq_len, vocab,
                                                use_pgen=False, use_sample=False)
                         val_batches = 0
                         while True:
-                            (enc_in, dec_in, features) = val_dg.get_batch(split='val')
+                            (enc_in, dec_in) = val_dg.get_batch(split='val')
                             if enc_in.shape[0] != params.batch_size:
                                 break
                             val_batches += 1
                             feed_dict = {
                                 Summa.x: enc_in,
                                 Summa.y: dec_in,
-                                Summa.feats: features
                             }
                             [val_loss, _] = sess.run([Summa.loss, streaming_loss_update], feed_dict)
                             eval_loss += val_loss
@@ -104,7 +103,7 @@ def train():
                         print('Validation Step: ' + str(val_step) + ' Loss in validation: ' + str(
                             eval_loss / val_batches))
                         f.write('Validation Step: ' + str(val_step) + ' Loss in validation: ' + str(
-                            eval_loss / val_batches) + '\n')  # fix
+                            eval_loss / val_batches) + '\n')
                         f.flush()
                         if eval_loss < min_eval_loss:
                             min_eval_loss = eval_loss

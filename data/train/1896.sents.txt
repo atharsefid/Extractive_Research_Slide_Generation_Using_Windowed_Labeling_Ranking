@@ -1,0 +1,315 @@
+We present TRIAD, a new persistent key-value (KV) store based on Log-Structured Merge (LSM) trees.
+TRIAD improves LSM KV throughput by reducing the write amplification arising in the maintenance of the LSM tree structure.
+Although occurring in the background , write amplification consumes significant CPU and I/O resources.
+By reducing write amplification, TRIAD allows these resources to be used instead to improve user-facing throughput.
+TRIAD uses a holistic combination of three techniques.
+At the LSM memory component level, TRIAD leverages skew in data popularity to avoid frequent I/O operations on the most popular keys.
+At the storage level, TRIAD amortizes management costs by deferring and batching multiple I/O operations.
+At the commit log level, TRIAD avoids duplicate writes to storage.
+We implement TRIAD as an extension of Facebook's RocksDB and evaluate it with production and synthetic workloads.
+With these workloads, TRIAD yields up to 193% improvement in throughput.
+It reduces write amplification by a factor of up to 4x, and decreases the amount of I/O by an order of magnitude.
+Key-value (KV) stores [1,3,4,12,29,35,38,39,47] are nowadays a widespread solution for handling large-scale data in cloud-based applications.
+They have several advantages over traditional DBMSs, including simplicity, scalability, and high throughput.
+KV store applications include, among others, messaging [12,18], online shopping [25], search indexing [22] and advertising [12,22].
+At Nutanix, we use KV stores for storing the metadata for our core enterprise platform, which serves thousands of customers with petabytes of storage capacity [21].
+KV store systems are available for workloads that fit entirely in memory (e.g., Mica [36], Redis [3], and Memcached [2]), as well as for workloads that require persistent storage (e.g., LevelDB [4], RocksDB [12]).
+LogStructured Merge trees (LSMs) [41,40] are a popular design choice for the latter category.
+LSMs achieve high write throughput at the expense of a small decrease in read throughput.
+They are today employed in a wide range of KV stores such as LevelDB [4], RocksDB [12], Cassandra [1], cLSM [29], and bLSM [44].
+Broadly speaking, LSMs are organized in two components: a memory component and a disk component.
+The memory component seeks to absorb updates.
+For applications that do not tolerate data loss in the case of failure, the updates may be temporarily backed up in a commit log stored on disk.
+When the memory component becomes full, it is flushed to persistent storage, and a new one is installed.
+The disk component is organized into levels, each level containing a number of sorted files, called SSTables.
+The levels closer to the memory component hold the fresher information.
+When level L i is full, one or more selected files from level L i are compacted into files at level L i+1 , discarding stale values.
+This compaction operation occurs in the background.Compaction and flushing are key operations, responsible for maintaining the LSM structure and its properties.
+Unfortunately, they take up a significant amount of the available resources.
+For instance, for our production workloads at Nutanix, our measurements indicate that, at peak times, compaction can consume up to 45% of the CPU.
+Moreover, per cluster, an average of 2.5 hours per day is spent on compaction operations for the maps storing the metadata.
+Clearly, compaction and flushing pose an important performance challenge, even though they occur outside the critical path of user-facing operations.We propose three new complementary techniques to close this gap.
+Our techniques reduce both the time and space taken by the compaction and flushing operations, leading to increased throughput.
+The first technique decreases compaction overhead for skewed workloads.
+We keep KV pairs that are updated frequently (i.e., hot en-tries) in the memory component, and we only flush the cold entries.
+This separation eliminates frequent compactions triggered by different versions of the same hot entry.
+The main idea of the second technique is to defer file compaction until the overlap between files becomes large enough, so as to merge a high number of duplicate keys.
+Finally, our third technique avoids flushing the memory component altogether, by changing the role the commit logs play in LSMs and using them in a manner similar to SSTables.Combined, our three techniques form TRIAD, a new LSM KV store we build on top of RocksDB.
+We extensively compare TRIAD against the original version of RocksDB on various synthetic workloads, with a focus on skewed workloads, as well as on Nutanix production workloads.
+TRIAD achieves up to 193% higher throughput than RocksDB.
+This improvement is the result of an order of magnitude decrease in I/O due to compaction and flushing, up to 4x lower write amplification and 77% less time spent compacting and flushing, on average.To summarize, this paper makes the following key contributions: (1) the design of TRIAD, a system combining three complementary techniques for reducing compaction work in LSMs, each interesting in its own right, (2) a publicly available implementation of TRIAD as an extension of RocksDB, one of the most popular state-of-the-art LSM KV stores, and (3) an evaluation of its benefits in comparison to RocksDB.Roadmap.
+The rest of the paper is structured as follows.
+Section 2 gives an overview of the LSM tree.
+Section 3 presents the background I/O overheads in LSM KV stores.
+Section 4 presents our three techniques for reducing the impact of the compaction and flushing operations on performance.
+Section 5 describes our evaluation results.
+Section 6 discusses related work.
+Section 7 concludes the paper.
+We provide an overview of the LSM structure, its userfacing operations and the flushing and compaction processes that take place in the background.LSM Structure.
+The high-level view of a typical LSM-based KV store is shown in Figure 1.
+The system has three main components, which we briefly describe.
+▷Memory Component.
+The memory component C m is a sorted data structure residing in main memory.
+Its purpose is to temporarily absorb the updates performed on the KV store.
+The size of the memory component is typically small, ranging from a few MBs to tens of MBs.
+▷Disk Component.
+The disk component C disk is structured into multiple levels (L 0 , L 1 , . . . ), with increasing sizes.
+Each level contains multiple sorted files, called SSTables.
+The memory component C m is flushed to the first level, L 0 .
+Because of this, the SSTables in L 0 have overlapping key ranges.
+SSTables on levels L i (i ̸ = 0) have disjoint key ranges.
+The choice of the number of levels in C disk is an interesting aspect of the LSM structure.
+From a correctness perspective, it would suffice to have only two levels on disk: one to flush memory components and one in which we compact.
+However, there is an I/O disadvantage to this approach.
+When we merge L 0 SSTables into L 1 , we identify all the L 1 SSTables that have overlapping key ranges with the L 0 SSTable that is being compacted (the SSTables from L 0 cover the entire key range, because they are directly flushed from memory).
+If L 1 files are large, then fewer files would have overlapping key ranges, but we would have to re-write large files, leading to overhead in the compaction work and a penalty in terms of of memory use.
+If L 1 files are small, then a large number of files would have overlapping key ranges with the L 0 file.
+These files would need to be opened and rewritten, creating large overhead in the compaction work.
+The leveled structure allows LSMs to amortize the compaction work, as the updates trickle down the levels.
+▷Commit Log.
+The commit log is a file residing on disk.
+Its purpose is to temporarily log the updates that are made to C m (in small batches), if the application requires that the data is not lost in case of a failure.
+All updates performed on C m are also appended to the commit log.
+Typically, the size of the commit log is kept small in order to provide fast recovery in case the operations need to be replayed to recover from a failure.
+A typical value for the size of the commit log is on the order of hundreds of MB.User-facing operations.
+The main user-facing operations in LSM-based KV stores are reads (Get(k)) and updates (Update(k, v)).
+Update(k, v) associates value v to key k. Updates are absorbed in C m and possibly appended to the commit log.
+Hence, LSM KV stores achieve high write throughput.
+Get(k) returns the most recent value of k.
+As illustrated in Figure 1, the read first goes to C m ; if k is not found in C m , the read continues to L 0 , checking all the files.
+If k is not found in L 0 , the read goes to L 1 ,. . . L n , until k is found.
+Apart from L 0 , only one file is checked for the rest of C disk 's levels, because of the non-overlapping key ranges property.Flushing.
+LSM KV stores have two main background operations: flushing and compaction.
+Flushing is the operation that writes C m to L 0 , once C m becomes full.
+In case a commit log is used, the flush can also be triggered by the commit log getting full, even if there is still room in the memory component.Compaction.
+Compaction is the background operation that merges files in disk component L i into files with overlapping key ranges in disk component L i+1 , discarding older values in the process.
+Leveled compaction is a popular strategy for compaction in LSM KV stores [5,14].
+When the size of L i exceeds its target size, a file F in L i is picked and merged into the files from L i+1 that have overlapping key ranges with F, in a way similar to a merge sort.
+Therefore, in the case of leveled LSM trees, each KV pair might be eventually propagated down to the component on the last level.
+Hence, some KV pairs could be rewritten once for every level during compaction.
+RocksDB and TRIAD employ leveled compaction.
+The techniques proposed by TRIAD could, however, easily be adapted to size-tiered [22] approaches.
+Despite I/O operations not being in the critical path of user-facing operations, flushing, logging and compaction still consume computational resources.
+The amount of CPU cycles spent to coordinate these operations translates into a commensurate amount of processing power that cannot be used to serve the user-generated workload.
+Hence, the frequency and the length of the I/O operations have a significant impact on the final performance perceived by the user.We provide experimental evidence of this claim by measuring the extent of the performance reduction due to I/O operations.
+We consider two workloads that exhibit different levels of skew in the data popularity (skewed/uniform) and two read/write mixes (write dominated and balanced).
+We run these workloads on RocksDB and on a version of RocksDB in which we disable background I/O operations (i.e., flushing and compaction; logging was enabled for both experiments).
+We pin all of the system activity (i.e., 8 worker threads and all threads created by the KV store) to 8 cores.
+The LSM structures of the two systems are pre-populated with an identical value for every key accessed during the experiment.
+This ensures that every read operation can be served, possibly by traversing the on-disk LSM tree.
+In the RocksdDB version with no background I/O, when a memory component is full, we discard it instead of persisting it, serving requests only from the pre-populated data store.
+We compare the throughput achieved by the two systems and report it in Figure 2.
+The plot shows that, for all workloads, background I/O represents a major performance bottleneck, yielding up to a 3x in throughput loss with respect to the ideal case.
+Driven by these results, we investigate the causes that trigger frequent and intensive I/O operations.
+We identify three main sources of expensive I/O operations, one for each of the three main components of the LSM tree architecture, namely (1) data-skew unawareness, at the memory component level; (2) premature and iterative compaction, at the LSM tree level; (3) duplicated writes at the logging level.1.
+Data skew unawareness.
+Many KV store workloads exhibit skewed data popularity, in which a few hot keys have a much higher probability of being updated than cold keys [16].
+As we show in Section 5, some Nutanix production workloads also exhibit similar skew.Data skew causes the commit log to grow more rapidly than C m , because updates to the same keys are appended to the log but absorbed in-place by C m .
+This triggers frequent flushes of C m before it reaches its maximum size.
+Not only does this increase the frequency of flushing, but because the size of the flushed C m is often smaller than the maximum, the fixed cost of opening and storing a file in L 0 is not amortized by the actual writing of data in it.Data skew also has a negative impact on the extent of the compaction process.
+In fact, it is highly likely that a copy of a hot key is present in many levels of the LSM tree structure.
+This results in frequent compaction operations that easily trickle down the LSM tree structure, causing long cascading compaction phases at L i that likely result into spilling new data to L i+1 .
+2.
+Premature and iterative compaction.
+Existing LSM KV systems exhibit a two-fold limitation in the compaction process.
+Some LSM KV stores keep only one file in L 0 to avoid looking up several SSTables in L 0 when reading [5].
+As a result, every time the memory component is flushed, a compaction from L 0 to the underlying levels is triggered.
+This choice leads to frequent compactions of the LSM tree.Other LSM schemes [4,12,14] keep several files in L 0 .
+This approach leads to the second limitation of existing LSM KV stores.
+The issue lies in how LSMs compact L 0 to L 1 when several SSTables are present in L 0 .
+In fact, files in L 0 are compacted to higher levels one at a time, resulting in several consecutive compaction operations.
+If two files in L 0 share a common key, this key is compacted twice in the underlying LSM tree.
+Data skew exacerbates this problem, because it increases the probability that multiple L 0 files contain the same set of hot keys.
+Clearly, the higher the load on the system, the higher is the probability of this event happening.This phenomenon can also arise in systems that keep a single file in L 0 .
+Indeed, during the compaction, the system continues serving user operations, thus potentially triggering multiple flushes of the memory component to L 0 .
+As a result, when a compaction finishes, it is possible that multiple files reside in L 0 .3.
+Duplicate writes.
+When C m is flushed to L 0 , the corresponding commit log is discarded because flushing already ensures the durability of the data.
+Each KV pair in the new file in L 0 , however, corresponds to the last version of a key written in the memory component and, hence, appended to the commit log.
+Therefore, when flushing the memory component to disk in L 0 , the system is actually replaying I/O that it has already performed when populating the commit log.
+We now provide a detailed description of TRIAD's techniques.
+The pseudocode for the main parts of TRIAD's bypassing new file creation during flushes, at the commit log level.
+The three techniques complement each other and target the main components of LSM KV stores.
+Even if they work best together, they are stand-alone techniques and generally applicable to LSM-based KV stores.
+The goal of TRIAD-MEM is to leverage the skew exhibited by many workloads [16] to reduce flushing and, hence, reduce the frequency of compactions.
+To this end, TRIAD-MEM only flushes cold keys to disk, while keeping hot keys in memory.
+This avoids the numerous compactions triggered to ensure non-overlapping key ranges in the LSM disk structure.TRIAD-MEM separates entries that are updated often (i.e., hot entries) from entries which are rarely updated (i.e., cold entries) upon flushing C m to L 0 .
+The hot entries are kept in the new C m and only the cold entries are written to disk.
+This way, the hot entries are updated just in-memory and do not trigger a high number of compactions on disk.
+The hot-cold key separation during a flush to L 0 is shown in Figure 3 and Figure 4.
+The separation between hot and cold keys is shown in the separateKeys function in Algorithm 2.
+The top-K entries of the old C m are selected, where K is a parameter of the system.
+Ideally, K should be high enough to accommodate all the hot keys, but low enough to avoid a high memory overhead for C m .
+Thus, properly setting K requires some a priori knowledge about the workload.
+TRIAD, however, is designed to deliver high per- formance with no information about the workload.
+In our current implementation, K is a constant.
+We will show in Section 5 that thanks to its holistic multi-level approach, TRIAD is robust against settings of K that correspond to not storing all the hot keys in memory.
+We are also currently investigating techniques to automatically set K depending on the runtime workload, for example by means of hill climbing [43].
+The entries that are preserved in the new memory component and not sent to disk are written to the commit log associated to the new memory component, as shown in Figure 3.
+This write-back is necessary in order to not lose information.
+A final optimization when separating the hot and cold keys is not flushing at all if C m 's size is not larger than a certain threshold (denoted FLUSH_T H in Algorithm 1).
+Indeed, in the case of very skewed workloads, a flush might be triggered not because C m is full, but because the commit log becomes full.
+To avoid having a large number of small files, we keep all entries in memory, discard the old commit log, and create a new commit log, with only the freshest values of C m entries.We experiment with several methods for hot-cold key detection, including looking at mean and standard deviation of the update frequencies, and selection according to quantiles.
+Simply selecting as hot keys those keys that are updated with higher frequency than the average one is effective in all workloads.
+TRIAD-DISK acts at L 0 of the LSM disk component.
+In a nutshell, TRIAD-DISK delays compaction until there is enough key overlap in the files that are being compacted.
+To approximate the key overlap between files, we use the HyperLogLog (HLL) probabilistic cardinality estimator [28,30].
+HLL is an algorithm that approximates the number of distinct elements in a multiset.
+To compute the overlap between a set of files, we define a metric we call the overlap ratio.
+Assuming we have n files on L 0 , the overlap ratio is defined as 1 -(UniqueKeys( f ile 1 , f ile 2 , . . . f ile n )) / sum(Keys( f ile i )),where Keys( f ile i ) is the number of keys of the i-th SSTable and UniqueKeys is the number of unique keys after merging the n files.
+UniqueKeys and Key( f ile i ) are approximated using HLL.
+Figure 5 shows an example of how the overlap ratio is used to defer compaction.
+In the upper part of the figure, there is only one file on L 0 ; the L 0 file overlaps with two files on L 1 .
+Since the overlap ratio is smaller than the cutoff threshold in this case, compaction is deferred.
+The lower part of the figure shows the system at a time when L 0 contains two files.
+The overlap ratio is computed between all the files in L 0 and their respective overlapping files on L 1 .
+The overlap ratio is higher than the threshold, so compaction can proceed, by doing a multi-way merge between all files in L 0 and the overlapping files in L 1 .
+The function deferCompaction in Algorithm 2 shows the TRIAD-DISK pseudo-code.
+We associate an HLL structure to each L 0 file in the LSM disk component.
+Before each compaction in L 0 , we calculate the overlap ratio of all files in L 0 .
+If the overlap ratio is below a threshold, we defer the compaction, unless the number of files in L 0 exceeds the maximum allowed number.
+If the maximum number of files in L 0 is reached, we proceed with the L 0 to L 1 compaction, regardless of the key overlap.The use of HLL is not new in the context of LSM compaction.
+So far, however, the way HLL is used is to detect which files have the most key overlap to be compacted (for instance in systems such as Cassandra [1]).
+This way, the highest number of duplicate keys is discarded during compaction.
+RocksDB employs a similar idea, where the estimation of the key overlap in files at L i and L i+1 is based on the files' key ranges and sizes.
+Our use of HLL is different.
+Instead of employing HLL to decide which files to compact, we are using HLL to decide whether to compact L 0 into L 1 at the current moment, or defer it to a later point in time.
+If the L 0 and L 1 SSTables do not have enough key overlap, compaction is delayed until more L 0 SSTables are generated.Current LSMs trigger the compaction of L 0 into L 1 as soon as the number of files on L 0 reaches a certain threshold.
+The larger the threshold, the more files need to be accessed in L 0 by read operations, which increases read latency.
+However, since the chance of a key being present multiple files on L 0 is low (otherwise, the large overlap ratio would trigger compaction), TRIAD-DISK can tolerate more files in L 0 without hurting read performance, as we show in Section 5.
+The main insight of TRIAD-LOG is that the data that is written to memory and then persisted into L 0 SSTables is already written to disk, in the commit log.
+The general idea of TRIAD-LOG is to transform CL into a special type of L 0 SSTable, a CL-SSTable.
+This way, flushing from memory to L 0 is avoided altogether.TRIAD-LOG enhances the role played by the commit log.
+As C m is being written to, the commit log plays its classic role.
+When flushing is triggered, instead of copying C m to disk, we convert the commit log into a CLSSTable.
+As shown in Figure 6, instead of storing copies of the memory components in L 0 , we store CL-SSTables.
+For readability, we only depict the TRIAD-LOG technique, and not the integration with our two other techniques.The advantage of treating the commit logs as L 0 SSTables is that the I/O due to flushing from memory is avoided.
+However, unlike SSTables, the commit log is not sorted.
+The sorted structure of the classic SSTables makes it easy to merge SSTables during compaction and to retrieve information from the files.
+To avoid scanning the entire CL-SSTable in order to find an entry in L 0 files, we keep the commit log file offset of the most recent update in C m , for each KV pair.
+Once the flush operation is triggered, only the small index associated to the offsets in the commit log is written to disk.
+The index is then grouped with its corresponding commit log file, thus creating the new L 0 CL-SSTable format.For instance, consider a commit log with entries of size 8B, in the format (Key; Value): (1;10), (2;20), (3;30), (4;40), (3;300).
+Then, in C m , TRIAD-LOG keeps the following entries, in the format (Key; Value; CL offset; CL name): (1; 10; 0; CL-name), (2; 20; 8; CLname), (3; 300; 32; CL-name), and (4; 40; 24; CLname).
+The CL offset is equal to 32 for Key 3, because we keep the offset of the most recent update.TRIAD-LOG offers the greatest benefits when the workload is more uniform.
+For such workloads it is relatively rare that the same key appears several times in the log.
+The corresponding CL-SSTable therefore contains the most recent values of many distinct keys, and relatively few older values.
+For skewed workloads, in contrast, the log typically contains multiple updates of the same keys, and the corresponding CL-SSTable therefore stores a high number of old values that are no longer relevant.The flow of the write operation remains unchanged by TRIAD-LOG.
+The writes are performed in C m and persisted in the commit log.
+The only difference is that apart from the value associated to the key, the commit log name and offset entries are updated as well.
+Similarly, the read path is largely unchanged, except for accessing the files in L 0 .
+As before, the reads first look in C m , then in all of the L 0 files, and then in one file for each of the lower levels of the disk component.
+Unlike before, when a file from L 0 is read, the index is searched for the key, and, if found, the CL-SSTable is accessed at the corresponding offset.
+Compaction from L 1 to L n is unchanged, because no modifications are done to the SSTable format on these levels.
+Only the compaction between L 0 and L 1 is affected by our technique.
+A new compaction operation is needed for merging a CL-SSTable with a regular SSTable.
+Since the index kept on the CL-SSTable is sorted, it is still possible to proceed in a merge-sort style manner.
+For clarity and brevity of the presentation, we omit the pseudocode for merging SSTables.It is straightforward to integrate TRIAD-LOG with TRIAD-DISK, since TRIAD-DISK affects only the decision to call compaction.
+The integration with TRIAD-MEM is done by flushing only the part of the index corresponding to the cold keys, ignoring the offsets of the hot keys.
+Then, during compaction, the hot keys are skipped, similarly to the duplicate updates.TRIAD Memory Overhead Analysis.
+TRIAD reduces I/O by using additional metadata in memory.
+TRIAD-MEM needs an update frequency (4B) field for each memory component entry.
+For each (CL-)SSTable on L 0 , TRIAD-DISK tracks the HLL structure (4KB per file).
+TRIAD-LOG adds two new fields for each memory component entry: the commit log file ID (4B) and the offset in the commit log (4B).
+Finally, TRIAD-LOG keeps track of the offsets index (8B per entry) for each CL-SSTable on L 0 .
+While the HLLs and offset indexes could be stored on disk, this would incur a performance penalty.
+Since the number of files on L 0 is not large, the memory overhead is not significant.
+Generally, less than 10 files are kept on L 0 .
+Hence, an upper bound on TRIAD's memory overhead is: 12B * EntriesC m + 10 * (4KB + EntriesC m * 8B).
+In our tests, the memory overhead is on the order of tens of MB, which is negligible with respect to the tens of GB of I/O saved.
+We implement TRIAD as an extension of Facebook's popular RocksDB LSM-based KV store.
+The source code of our implementation is available at https://github .
+com/epfl-labos/TRIAD.
+We evaluate TRIAD with production and synthetic workloads, and we compare it against RocksDB.
+We show that: (1) TRIAD achieves up to 193% higher throughput in production workloads.
+(2) TRIAD effectively reduces I/O by an order of magnitude and spends, on average, 77% less time performing flushing and compaction.
+(3) TRIAD's three techniques work in synergy and enable the system to achieve high throughput without a priori information about the workload (e.g., skew on data popularity or write intensity).
+We compare TRIAD against RocksDB.
+Unless stated otherwise, RocksDB is configured to run with its default parameters, and we do not change the corresponding values in the TRIAD implementation.
+TRIAD uses an overlap threshold of 0.4 and a maximum number of 6 L 0 files for TRIAD-DISK.
+In addition, we configure TRIAD-MEM such that its definition of hot keys corresponds to the top 1 percent of keys in terms of access frequency.To evaluate TRIAD, we use four production workloads from Nutanix (see Section 5.2).
+We complement our evaluation with synthetic benchmarks that allow us to control key parameters of the workload, such as skew and write intensity (see Section 5.3).
+The evaluation is performed on a 20 core Intel Xeon, with two 10-core 2.8 GHz processors, 256 GB of RAM, 960GB SSD Samsung 843T, running Ubuntu 14.04.
+Each synthetic benchmark experiment consists of a number of threads concurrently performing operations on the KV store -searching, inserting or deleting keys.
+Each operation is chosen at random, according to the given workload probability distribution, and performed on a key chosen according to the given workload skew distribution.
+Before each experiment, the LSM tree is initialized with roughly half of the keys in the key range.We use as evaluation metrics throughput measured in KOperations/second (KOPS), bytes written to disk, time spent in background operations (i.e., compaction and flushing), write amplification (WA), and read amplification (RA).
+WA and RA are established metrics for measuring I/O LSM KV store efficiency [4,12,32,34,35,38,48].
+WA is the amount of data written to storage compared to the amount of data that the application writes.
+Intuitively, the lower the WA, the less work is done during compaction.
+We compute system-wide WA as: WA = ( The production workloads used for the evaluation of TRIAD are internal Nutanix metadata workloads.
+The key probability distributions of the workloads are shown in Figure 7.
+The data sizes and number of updates are shown in Figure 8.
+The production workloads have two different skew profiles: W2 and W4 have more skew in their access patterns, W1 and W3 have less skew.
+The left-hand side of Figure 9A presents the throughput comparison between RocksDB and TRIAD, for the four production workloads.
+TRIAD outperforms RocksDB in the four workloads, with a throughput increase of up to 193%.
+The right-hand side of Figure 9A shows the corresponding WA for each of the workloads.
+TRIAD reduces WA by up to 4x.
+As expected [34], in RocksDB the WA is higher for the less skewed workloads (W1 and W3) and lower for the more skewed workloads (W2 and W4).
+There is also a clear correlation between the throughput and the WA: throughput is lower in the workloads with higher WA.For TRIAD WA is uniform across the four workloads, because TRIAD-MEM converts the skew of the application workload into a disk workload that is closer to uniform.
+Hence, the workload skew perceived by the disk component is more or less the same across the four workloads, leading, in turn, to more predictable throughput.
+In contrast with RocksDB, TRIAD's throughput does not exhibit high fluctuation across workloads.
+We explore this connection between throughput and WA further in the next section.
+We define three workload skew profiles: (WS1) A highly skewed workload where 1% of the data is accessed and updated 99% of the time.
+This workload reflects the characteristics of Facebook workloads analyzed in [16].
+(WS2) A medium skew workload, where 20% of the data is accessed and updated 80% of the time.
+(WS3) A uniform workload where all keys have the same popularity.We use two different read-write ratios: one with 10% reads and 90% writes, and one with 50% reads and 50% writes.
+In all experiments, each key is 8B and each value is 255B.
+To shorten our experiments with the synthetic workloads, we use a small memory component of 4MB and a dataset of 1M keys, so that compactions happen at shorter time intervals.
+Figure 9B shows the throughput comparison between TRIAD and RocksDB for the three workload skews and two read-write ratios.
+Figure 9C shows the corresponding WA.
+TRIAD performs up to 2.5x better than RocksDB for the skewed workloads and up to 2.2x better for the uniform workloads.For WS1 all the hot data fits in memory, allowing TRIAD to achieve a throughput increase of 50% for both the write-intensive and the balanced workloads.
+For WS2, TRIAD-MEM cannot accommodate all the hot keys.
+Nevertheless, TRIAD still achieves a throughput gain of 51% in the write-intensive workload and 25% in the balanced workload, because TRIAD-DISK and TRIAD-LOG act as a safety net against possible undersizing of the data structure tracking hot keys (Section 4.1), due to lack of detailed knowledge of the workload characteristics.
+This result showcases the robustness of TRIAD: It consistently delivers high performance, despite not having any prior knowledge of the incoming workload.WA is decreased by up to 4x in the moderately skewed and uniform workloads.
+For the highly skewed workload, however, the WA does not change, despite the gain in throughput.
+This happens because the 1% of the data that is updated 99% of the time fits entirely in memory.
+As a consequence, C m is only rarely flushed (as we explain in Section 4), because it takes longer for enough cold entries to be present in C m to trigger a flush.
+Therefore, even if the total number of bytes is decreased by an order of magnitude, as Figure 9D shows on the lefthand side, the proportion between the compacted bytes and flushed bytes is similar to RocksDB.Finally, the right-hand side of Figure 9D shows the time spent in compaction.
+For the highly skewed workload, the time spent in compaction in TRIAD is an order of magnitude lower than RocksDB, for the same reason as explained above.
+For the moderately skewed and Throughput Skew 1%-99% Throughput Skew 1%-99%LoWA LSM uniform workloads, the time spent in compaction is decreased by 48% and 72%, respectively.
+We discuss the contribution of each of TRIAD's techniques, for different types of workloads, reporting the throughput achieved by versions of TRIAD where we only implement one out of the three techniques.
+Figure 10 shows the throughput breakdown for each of the techniques, for synthetic workloads WS3 (lefthand side) and WS1 (right-hand side), with a 10%-90% read-write ratio.
+While all three techniques outperform RocksDB individually, TRIAD-MEM brings more benefits than TRIAD-DISK and TRIAD-LOG for the highly skewed workload, and vice-versa for the uniform workload.
+Indeed, TRIAD-MEM alone obtains 97% of the throughput that TRIAD achieves for the skewed workload.
+For the uniform workload, TRIAD-DISK and TRIAD-LOG obtain 85% and 97%, respectively.A similar trend can be noticed in the WA breakdown in Figure 11.
+TRIAD-MEM performs best for WS1, but does not decrease WA as the workload is closer to uniform, having close to no effect compared to RocksDB for the workload with no skew (right-most column).
+TRIAD-DISK and TRIAD-LOG are complementary to TRIAD-MEM, decreasing WA by up to 60% and 40%, respectively, for the uniform workload.The lower-right plot in Figure 11 shows the RA breakdown for a uniform workload, with 10% reads.
+As expected, TRIAD-MEM lowers RA, because more requests can be served from memory.
+TRIAD-DISK, however, increases RA compared to the baseline, as it keeps more files in L 0 , and all these files may have to be accessed on a read.
+TRIAD-LOG does not have an impact on read amplification.
+Overall, TRIAD has a low overhead over the baseline, increasing RA by at most 5%.
+The breakdown shows tat the three techniques are complementary: no one alone gives 100% of the benefits across all workload types.
+Their combination allows TRIAD to achieve high performance for any workload, automatically adapting to its characteristics without a priori knowledge.
+Our work is related to previous designs of LSM-based KV stores and to various systems that employ optimization techniques similar to the ones integrated in TRIAD.
+Related LSM-based KV stores.
+LevelDB [4] is one of the earliest LSM-based KV stores and employs levelstyle compaction.
+Its single-threaded compaction, along with the use of a global lock for synchronization at the memory component level are two of its main bottlenecks.
+RocksDB [12] introduces multi-threaded compaction and tackles other concurrency issues.
+LevelDB and RocksDB expose several tuning knobs, such as the number and the sizing of levels, and policies for compaction [13,14,27].
+Recent studies, simulations and analytical models show that the efficiency of LSM-based KV stores is highly dependent on their proper setting, as well as workload parameters [34,26] and requirements like memory budget [24].
+In contrast, TRIAD presents techniques that cover a large spectrum of workloads.
+Thanks to its holistic approach, TRIAD is able to deliver high performance without relying on a priori information about the workload.bLSM [44] proposes carefully scheduling compaction to bound write latency.
+VT-tree [45] uses an extra layer of indirection to avoid sorting any previously sorted KV pairs during compaction.
+HyperlevelDB [9] also addresses the write and compaction issues in LevelDB, through improved parallelism and an alternative compaction algorithm [7,8].
+HyperLevelDB's compaction chooses a set of SSTables which result in the lowest WA between two levels.
+TRIAD takes a different approach to prevent the occurrence of high WA, by using HLL to decide whether to compact or not at the first level of the disk component.LSM-trie [47] proposes a compaction scheme based on the use of cryptographic functions.
+This scheme gives up the sorted order of the entries in the LSM tree to favor compaction efficiency over performance in range queries.
+TRIAD instead preserves the sorted order of the keys, facilitating support for efficient range queries.WiscKey [37] separates keys from values and only stores keys in a sorted LSM tree, allowing it to reduce data movement, and consequently reduce write amplification.
+The techniques proposed in TRIAD are orthogonal to this approach, and can be leveraged in synergy to it to further enhance I/O efficiency.
+Cassandra [1], HBase [11] and BigTable [22] are distributed LSM KV stores, employing size-tiered compaction.
+In addition, Cassandra also supports the leveled compaction strategy, based on LevelDB's compaction scheme [5,6].
+For both compaction strategies, Cassandra introduced HyperLogLog (HLL) to estimate the overlap between SSTables, before starting the merge [10].
+TRIAD also makes use of HLL in its deferred compaction scheme.
+However, instead of using HLL to determine which files to compact, the overlap between files computed with HLL is used only at L 0 , to determine whether we should compact or wait.Ahmad and Kemme [15] also target a distributed KV store and propose to offload the compaction phase to dedicated servers.
+In contrast, the techniques proposed in TRIAD are applied within each single KV store instance and do not need dedicated resources to be implemented.Tucana [42], LOCS [46] and FloDB [17] act on other aspects of the KV store design to improve performance.
+Tucana uses an internal structure similar to a B − ε tree [20] and uses copy-on-write instead of write-ahead logging.
+LOCS exploits the knowledge of the underlying SSD multi-channel architecture to improve performance, e.g., by load balancing I/O.
+FloDB inserts an additional fast in-memory buffer on top of the existing in-memory component of the LSM tree to achieve better scalability.
+TRIAD can integrate some of these features to further improve its performance.
+Systems with similar optimization techniques.
+The hot-cold separation technique is employed in SSDs to improve the efficiency of the garbage collection needed by the Flash Translation Layer [23,33].
+In TRIAD, instead, it is used at the KV store level to reduce the amount of data written to disk.Delaying and batching the execution of updates is used in B − ε trees and in systems, e.g., file-systems [31], which use B − ε trees as main building block.
+This technique is employed to amortize the cost of updates [19] and to reduce the cases in which the effect of an update is immediately undone by a following update [49].
+By contrast, TRIAD defers the compaction of the L 0 level of the LSM tree and batches the compaction of multiple keys to increase the efficiency of the compaction process.
+TRIAD is a new LSM KV store aiming to reduce background I/O operations to disk.
+TRIAD embraces a holistic approach that operates at different levels of the LSM KV store architecture.
+TRIAD increases I/O efficiency by incorporating data skew awareness, by improving the compaction process of the LSM tree data structure and by performing more efficient logging.We compared TRIAD with Facebook's RocksDB and we showed, using production and synthetic workloads, that TRIAD achieves up to an order of magnitude lower I/O overhead and up to 193% higher throughput.

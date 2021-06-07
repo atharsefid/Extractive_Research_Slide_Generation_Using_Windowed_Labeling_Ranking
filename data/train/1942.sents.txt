@@ -1,0 +1,370 @@
+We develop an approach for the automatic and elastic management of memory in shared clusters executing data analytics applications.
+Our approach, called ElasticMem, comprises a technique for dynamically changing memory limits in Java virtual machines, models to predict memory usage and garbage collection cost, and a scheduling algorithm that dynamically reallocates memory between applications.
+Experiments with our prototype implementation show that our approach outperforms static memory allocation leading to fewer query failures when memory is scarce, up to 80% lower garbage collection overheads, and up to 30% lower query times when memory is abundant.
+The analysis of large datasets is an important problem and many big data systems are available to facilitate this task [2,29,33,36,48,53].
+To handle large data sizes, these systems execute in shared-nothing clusters.
+Whether public or private, clusters are typically shared by many queries (also called "applications") 1 and even many systems executing in the same cluster at the same time.
+In such shared clusters, a resource manager [25,47] is responsible for the resource allocation between systems and applications.
+Modern resource managers rely on containers (e.g., YARN [47], Docker [3], or Kubernetes [5] containers), which isolate applications that share the same machine and provide hard resource limits.
+Application resource requirements are both constrained and protected by the containers.
+Figure 1 illustrates the interaction between a resource manager and containers: the resource manager launches containers with resource limits and schedules applications inside those containers.Many modern data analytics systems, such as Spark 1 In this paper, we focus on applications that correspond to analytical queries and use the terms "application" and "query" interchangeably.
+System X App A Figure 1: A resource manager schedules multiple applications from multiple systems (Spark [53], Myria [48], and System X) in a shared cluster.
+An application may have multiple processes across multiple machines.
+The resource manager schedules applications by putting them in containers with resource limits.
+[53], Impala [29], GraphLab [33], Giraph [2], and Myria [22,48], strive to maximally utilize memory, yet memory remains an expensive resource.
+In this paper, we focus in particular on memory allocation.
+However, container-based scheduling has limitations for managing memory.
+When an application needs to run, it must estimate its resource requirements and communicate them to the resource manager.
+The latter then decides whether or not to schedule the application based on the amount of available resources.
+The challenge, however, is that it is hard to estimate the memory need of a data analytics application before executing it because it may depend on multiple runtime factors including the cardinalities of intermediate results, which are known to be hard to estimate [27,31].
+Having an inaccurate memory usage estimate can harm query performance in multiple ways.
+If the estimate is too high, cluster resources may be under-utilized.
+If the estimate is less than the minimum amount of memory needed to complete the query, the system must either spill data to disk, which leads to performance degradation, or fail with an out-of-memory error, wasting the resources already consumed by the query.
+This challenge exists in systems with manual memory management, such as those written in C/C++ [29,33], in Java-based systems that use byte arrays [8], and in systems that rely on automatic memory management provided by runtimes such as Java [2,48,52,53] and the .
+NET Common Language Runtime (CLR) [36].
+The situation is more complicated when garbage collection (GC) is used for automatic memory management, since GC activities add another layer of unpredictability to query performance.
+Even if the resource estimates are sufficient for the query to complete, garbage collection in some cases can significantly slow down query execution.
+As a concrete example, we demonstrate how changing the maximum heap size of Java-based systems can significantly impact query time in Section 2.
+To address these problems, we develop a new approach, called ElasticMem, where data analytics applications execute in separate containers, but the resource manager elastically adjusts the memory allocated to these containers.
+The optimization goal is to jointly minimize failures and total execution time of all applications subject to the physical limit on the total amount of memory in the cluster.
+We presented the vision behind the approach and a few preliminary results in a short workshop paper [49].
+In this paper, we develop the approach in full.Elastic container memory management is a difficult problem.
+First, elastic memory allocation is not supported in most systems.
+For Java-based systems, the maximum heap size of a Java virtual machine (JVM) stays constant during its lifetime.
+For C/C++-based systems such as Impala [29], limiting the resource of a process is usually done through Linux utilities such as cgroups, which do not expose functionality to change resource limits at runtime.
+For systems that run in CLR [36], the problem is opposite: No control on the heap size can be specified, so the heap can grow arbitrarily up to the total physical memory.
+Second, in order to elastically and dynamically allocate memory to data analytics applications, we need to understand how extra memory can prevent failures and speed up these applications.
+We need models of GC benefits and overheads.
+Finally, we need an algorithm that uses the models to orchestrate memory allocation across multiple data analytics applications.We present our approach to address all three challenges.
+We focus on analytical applications, in particular relational algebra queries on large data, and Java-based systems.
+Since memory management in Java containers (e.g., YARN [47]) is determined by JVMs internally, we focus on how and when to change the memory layouts of JVMs.
+Specifically, our contributions are the following:• We show how to modify the JVM to enable dynamic changes to an application's heap layout for elastic management of its memory utilizations (Section 3.1).
+• Our key contribution is an algorithm for elastically managing memory across multiple applications in a big data analytics system to achieve an overall optimization goal (Section 3.2).
+In this paper, we present scenarios where each query runs in one JVM and multiple queries run in one machine, but our approach can be extended to a multi-machine setting.
+• In support of elastic memory management, we develop a machine-learning based technique for predicting the heap state and GC overhead for a relational query and whether it is expected to run out of memory (Section 3.3) based on operator statistics.
+Since the common approach for implementing relational operators in memory, such as joins and aggregates, is to use hash tables [19], we build models that use hash table statistics as input.We evaluate our elastic memory management techniques using TPC-H queries [6] on Myria [22,48], a shared-nothing data analytics system, against containers with fixed memory limits.
+In our experiments, our approach outperforms static allocation: It reduces the number of query failures; it reduces query times by up to 30%, GC times by up to 80%, and overall resource utilization (Section 4).
+Many big data analytics systems today, including Spark [53], Flink [1], Hadoop [52], Giraph [2], and Myria [48], are written in programming languages with automatic memory management, specifically Java.
+Garbage collection associated with automatic memory management is known to cause performance variations that are hard to control: The GC policy, although customizable by the programmer to some extent, is controlled by the runtime internally.
+Depending on the policy and heap state, the time and frequency of GCs may vary significantly and, as we later show in this section, may significantly impact query performance.
+Over the past decade, there have been several JVM implementations with various GC algorithms.
+However, most of the contemporary ones share the concept of generations [9].
+With this design, the heap space is partitioned into multiple generations for storing objects with different ages.
+Figure 2 illustrates the internal state of a JVM heap with two generations.
+Initial memory allocation requests always go to the young generation.
+When it fills up, a GC is triggered to clean up dead objects.
+There are different types of GCs as shown in Figure 2.
+In a young collection, live objects in the young generation are promoted to the old generation.
+In a full collection, dead objects are cleaned from both generations in addition to promotions.
+The type of collection to trigger depends on whether a promotion failure, i.e., insufficient space for promoting objects from the young generation, is expected to occur or actually occurs.
+In this paper, we use OpenJDK as the reference JVM implementation.
+We focus on the common class of GC algorithms that use a young and old generation, and leave extensions to other languages and GC algorithms to future work.
+We show a concrete example of how GC can impact query execution by executing a self-join query on a synthetic dataset containing ten million tuples with two int columns, on three systems: Myria, Spark 1.1 and Spark 2.0, using one process on one machine with default GC collectors (-XX:+UseParallelGC).
+Figure 3 shows the query execution times with different heap-size limits.
+Each data point is the average of five trials with error bars showing the minimum and maximum values.
+For both Myria and Spark 2.0, when the heap is large, the query time converges to approximately 35 seconds, which is the pure query time with almost no GC.
+When we shrink the heap size, however, the run times increase moderately due to more GC time.
+For Myria, the run time increases from 35 seconds to 55 seconds when the heap size goes from 16 GB to 3 GB, and further increases drastically to 141 seconds when the heap size shrinks from 3 GB to 2 GB.
+Eventually, Myria fails with an out-of-memory error when the limit is less than 2 GB.
+Similarly, the query time for Spark 1.1 has a steep increase from 86 to 466 seconds when the heap size changes from 5 to 4 GB, and the query fails when the heap size is less than 4 GB.
+Spark 2.0 follows a similar trend as Myria, but does not fail even with only 500 MB of memory because it is able to spill data to disk when memory is insufficient.
+As a result, however, its execution time increases to 127 seconds.L L L L L L D D L L L D D L L L D D L L L L L L L N Young Genera+on Old Genera+on Heap L L L L L L D D L D New Alloca+on (GROW) Young Collec+on (YGC) Full Collec+on (FGC p ) Ini+al In this section, we present our approach, called ElasticMem, for elastic memory allocation.
+ElasticMem comprises three key components.
+First, ElasticMem needs JVMs that can change memory limits dynamically, and we describe how we modify OpenJDK to enable this feature in Section 3.1.
+Second, the heart of ElasticMem is a memory manager that dynamically allocates memory across multiple queries (Section 3.2).
+Finally, to drive the manager's allocation decisions, ElasticMem uses models that predict the heap state and the GC costs (i.e., impact on run time) and benefits (i.e., expected freed memory) at any point during query execution (Section 3.3).
+The implementation of our approach is available at our website [4].
+OpenJDK manages an application's memory as follows: First, the user specifies the maximum heap size of a JVM process before launching it.
+The JVM then asks the operating system to reserve the heap space and divides the space into generations based on its internal size policy as in Fig- ure 2.
+During program execution, if a memory allocation request cannot be satisfied due to insufficient memory, the JVM may trigger GCs to release some memory.
+If not much memory is released after spending a large amount of time on GC, the JVM throws an OutOfMemory error.The maximum heap size stays constant during a JVM's lifetime.
+It cannot be increased even if an OutOfMemory is thrown while more memory is available on the machine, or decreased if heap space is underutilized.
+This rigid design, however, is unnecessary.
+For operating systems that support overcommitting memory, a logical address space does not physically occupy any memory until it is used.
+This property, together with 64-bit address spaces, allow us to reserve and commit a large address space when launching a JVM.
+The actual memory limits on heap spaces, such as generations, can be modified later during runtime.We modify the source code of OpenJDK to implement this feature.
+We change the JVM to reserve and commit a continuous address space of a specified maximum heap size (-Xmx) when it launches.
+The initial size limit of each generation is set according to the JVM's internal policy.
+We make the maximum heap size large enough such that the per-generation limits are sufficiently large to become irrelevant.
+Additionally, we add our new dynamic size limits to both the young and old generation of a JVM p, denoted with y limit (p) and o limit (p) respectively.
+Our memory manager changes these limits at runtime.
+We set their initial values to reasonably small numbers (e.g., 1 GB) and prevent each generation from using more memory than its dynamic limit.To interact with the JVM, we add a socket-based API through which the JVM receives instructions such as requests for the current heap state, memory limit adjustments, or GC triggers.
+We disable the JVM's internal GC policies to let our memory manager control when and which GCs to happen.
+We modify GC implementations to always release recycled memory to the OS.
+If more memory is needed but unavailable given the current limits, we let the JVM pause until more memory is available.
+We implement our changes on top of OpenJDK 7u85's default heap implementation (ParallelScavengeHeap), which contains approximately 1000 lines of code.
+The main component of ElasticMem is a memory manager.
+It monitors concurrently executing queries and alters their JVMs' memory utilizations by performing actions on the JVMs, such as triggering a GC or killing the JVM.
+Each action has a value, and the objective is to maximize the sum of all action values.
+A value is a combination of several factors, including whether the action kills a JVM, causes a JVM to pause, or how efficiently it enables the JVM to acquire memory: i.e., the ratio of time spent over space acquired (from the OS or recovered through a GC).
+The manager makes decisions according to two pieces of information: the JVM heap states and the estimated values of performing actions on the JVMs.
+Because predicting these values far into the future carries significant uncertainty, and because our changes to the JVM enable us to adjust memory limits without any overhead, we develop a dynamic memory manager.
+The manager makes decisions adaptively at each timestep t for some small period [t,t + δ t ].
+At t, the manager gathers runtime statistics from each JVM and performs actions on it.
+Queries then execute for time δ t .
+Their states change and the manager makes another round of decisions at t + δ t .
+We describe our allocation algorithms in this section, starting with a more precise problem statement.
+We start with a single-node and a one-process-per-query scenario.
+As introduced in Section 1, each JVM is a container that executes a single query (or query partition).
+We model query execution as the process of accommodating the memory growth of the corresponding JVM.
+For a period [t,t + δ t ], the memory usage of a JVM may grow by some amount.
+We can perform various actions to the JVM to affect its memory utilization: allocate enough memory for the expected growth, trigger a GC, which may require extra memory in the short term but free up memory in the longer term, kill the JVM to release all its memory, or do nothing, which may stall a JVM if it cannot grow its memory utilization as needed.Consider a single physical machine with a total amount of memory M.
+A set of N JVMs {p 1 , . . . , p N } is running on it, each has used some space in both the young and the old generation.
+At the current timestep t, we need to allocate M across the N JVMs, such that the total memory used does not exceed M, while minimizing a global objective function.The memory that must be allocated to a JVM is entirely determined by the action that the manager selects.
+For example, to perform a young generation GC, the old generation needs to have enough space to accommodate the promoted young generation live objects.
+The manager must increase the memory limit for the old generation to accommodate the added space requirement.
+We denote with y cap (p i , a i ) and o cap (p i , a i ), the minimal amount of memory that must be allocated to the young and old generation of JVM p i , if the manager chooses action a i .
+These values refer to the new required totals and not increments.Each action has a value that contributes to the global objective function.
+We denote the value of action a i on p i with value(p i , a i ).
+The objective function is thus:maximize N ∑ i=1 value(p i , a i ), a i ∈ Actions, subject to N ∑ i=1 (y cap (p i , a i ) + o cap (p i , a i )) ≤ M,where Actions is the set of possible actions.
+In our approach, the value(p i , a i ) is a structure with multiple fields.
+We describe its internal structure and how to sum and compare values in Section 3.2.3 below.The above definition can be extended to a sharednothing cluster scenario by letting the manager make decisions independently for each machine.
+Several runtime metrics are needed to compute the value and the space requirements of actions.
+Some are reported by the JVM while others are estimated by the manager:Metrics reported by the JVM: For a JVM p at timestep t, y limit (p,t) and o limit (p,t) are the current memory limits of the young and old generation.
+The manager sets those limits at the previous timestep.
+However, only some of the space in each generation is used at t, and the JVM reports the used sizes as y used (p,t) and o used (p,t).
+Metrics estimated by the manager: Besides the above metrics, we also need to estimate some values Value Meaning y limit (p,t)Size limit of the young gen o limit (p,t)Size limit of the old gen y used (p,t)Total used space in the young gen o used (p,t)Total used space in the old genˆy genˆ genˆy live (p,t) Total size of live objects in the young genô genˆgenô live (p,t)Total size of live objects in the old genˆy genˆ genˆy dead (p,t) Total size of dead objects in the young genô genˆgenô dead (p,t)Total size of dead objects in the old genˆgrw genˆ genˆgrw(p,t) Estimated heap growth until next timestepˆgc timestepˆ timestepˆgc y (y ob j (p,t))Time to perform a young collectionˆgc collectionˆ collectionˆgc o (o ob j (p,t)) Time to perform an old collection Table 1: Runtime metrics reported by JVM p or estimated by the manager at timestep t. ˆ x indicates that x is estimated.
+"gen" is short for generation.that are not directly available.
+First, the space used in the young and old generation of a JVM is further divided into live and dead objects.
+The manager estimates the total size of those objects, which we denote withˆy withˆ withˆy live (p,t), ˆ y dead (p,t), ˆ o live (p,t) andôandˆandô dead (p,t).
+We usêusê x to indicate that a value x is estimated by the manager.
+Second, the manager needs to estimate p's heap growth, ˆ grw(p,t), before the next timestep, wherê grw(p,t) = ˆ y used (p,t + δ t ) − y used (p,t).
+Finally, to model the impact of a GC, the manager needs to know how much memory a GC will free, and how much time it will take.
+Since the target of a GC is the set of all objects in the generation(s) undergoing the GC, we use y ob j (p,t) to denote the set of all the objects in the young generation and similarly o ob j (p,t) for the old generation.
+2 ˆ gc y (y ob j (p,t)) andˆgc andˆ andˆgc o (o ob j (p,t)) are then the estimated times for a young and an old GC.
+We describe how the manager estimates these metrics in Section 3.3.
+Table 1 summarizes the notation.
+Since t is the only used timestep, we omit t and only use p as the argument in the rest of the paper when the context is clear.
+There are four types of actions that the manager can choose for each JVM: allowing the JVM to grow by asking the operating system for more memory, reducing the memory assigned to the JVM by performing a garbage collection and recycling space, 3 pausing the JVM if it cannot either grow or recycle enough memory, or as a last resort, killing a JVM to release its entire memory.
+The manager performs an action for every JVM at each timestep.
+An action a on a JVM p has value, value(p, a), with a minimum amount of memory needed for p's young and old generations, (y cap (p, a) and o cap (p, a)).
+We denote the time to perform a on p with time(p, a), and the size of the newly available space made by a with space(p, a).
+The cost of an action is the amount of time needed to acquire a given amount of space, or time(p,a) space(p,a) .
+The manager uses this ratio to compare and choose actions.The detailed set of Actions is as follows:• GROW: Let the JVM grow to continue query execution.
+In order to reserve space for the growth, the manager must allocate y cap (p, GROW) = y used (p) + ˆ grw(p) to the young generation and o cap (p, GROW) = ˆ y live (p) + o used (p) to the old generation.
+We reserve extra space in the old generation for prospective promotions to preserve the possibilities of having all types of GCs in the future.
+The cost is the time it takes to request and access the new space, which depends on the size of the space change given by: y cap (p, GROW) + o cap (p, GROW) − y limit (p) − o limit (p).
+Under normal circumstances, this will be the commonly selected action until space becomes tight and JVMs must start garbage collection or must pause before being able to grow again.
+• YGC: Trigger a young generation GC.
+The JVM needs at least the current used space, y used (p), for the young generation, andˆyandˆ andˆy live (p) + o used (p) for the old generation to avoid a promotion failure.
+The cost is the GC timê gc y (y ob j (p)), and we expect memory of sizêsizê y dead (p) to be recycled.
+• FGC p : Trigger a full GC by first performing a young generation collection to promote live objects to the old generation then performing a GC on the old generation.
+Similar to YGC, we need at least y used (p) andˆyandˆ andˆy live (p) + o used (p) for the young and old generations respectively.
+The cost is the GC timê gc y (y ob j (p)) + ˆ gc o (o ob j (p)) and the space to be recycled isˆyisˆ isˆy dead (p) + ˆ o dead (p).
+• FGC c : Trigger a full GC by first performing a GC on the whole heap, then trying to promote young generation live objects if possible, without changing the total heap size.
+Free space from the young generation after the first GC gets shifted to the old generation to make space for copying.
+Different from FGC p , we only need y used (p) and o used (p) for the young and old generation since the promotion is not mandatory.
+However, more GC time is needed since the full collection is now performed on both generations instead of only the old generation.
+We assume that the time grows proportionally to the size of live objects and usêgc y (y ob j (p)) + ˆ gc o (o ob j (p)) * ( ˆ y live (p) + ˆ o live (p))/ ˆ o live(p)as the GC time estimate.
+The memory to be recycled is alsôy dead (p) + ˆ o dead (p).
+• NOOP: Do nothing to the JVM, keep the current limits y limit (p) and o limit (p).
+As a consequence, the JVM is expected to pause since it cannot either grow or recycle enough memory by doing garbage collection.
+• KILL: Kill the JVM immediately.
+As a consequence, the query running in this JVM will fail.FGC p , which promotes first, is the default behavior in OpenJDK.
+However, the promotion may fail if the old generation does not have enough free space to absorb young generation live objects, and when it happens, JVM spends much time on copying the live objects back, so that the young generation remains the same as it was before the promotion.
+In other words, triggering FGC p while expecting a promotion failure is not cost effective.
+However, when memory is scarce, the manager may not be able to allocate extra space to avoid the promotion failure.
+In this case, we need a GC which can still recycle space without increasing the limits.
+We solve this problem by implementing another full GC procedure, FGC c : We first collect both generations, then shift young generation free space to the old generation to keep the total heap limit unchanged.
+A young GC is then performed if there is enough space for promoting.
+Table 2 summarizes the properties of all actions.
+os(m) denotes the time to access new memory of size m.
+We obtain its value by running a calibration program since this value changes for different systems and settings.
+Figure 2 illustrates the effect of all the actions except for NOOP and KILL, which have the obvious effects.We define the value of an action with three attributes, where only one of them is set to a non-zero value.
+For NOOP and KILL, we set the corresponding attributes to 1.
+For other actions, we use their cost, or time/space efficiency, as the value: i.e., how much time the action needs per unit of space that it makes available.
+Then for an action a on a VM p, its value value(p, a) is defined as:       value(p, a).
+cost = time(p, a) space(p, a) , for GROW, YGC, FGC p , FGC c , value(p, a).
+NOOP = 1, for NOOP, value(p, a).
+KILL = 1, for KILL,With the above definition, our manager can favor actions by comparing these three attributes in a certain order, as we describe in Section 3.2.4.
+Next, we discuss the allocation algorithm, which allocates memory to the JVMs by performing actions on them at each timestep.
+We model the problem as a 0-1 knapsack problem.
+The capacity of the knapsack is the total amount of memory, and the items are actions performed on JVMs.
+Each action has a value and a minimum space requirement as described in Table 2.
+The goal is to maximize the total item value in the knapsack without exceeding its capacity.
+The 0-1 knapsack problem is known to be NP-complete with a pseudo-polynomial dynamic programming solution [14].
+Let opt N,M denote the value of the best scheme for allocating memory of size M to the first N JVMs, p 1 · · · p N .
+If a JVM p i is undergoing a GC, the manager skips it to wait for the GC to complete.
+Otherwise, it derives opt i, j by enumerating possible actions on p i and picking the one that leads to the largest value for opt i, j .
+We define the sum of two values as the sum of their three attributes, then the state transition function is defined as:opt i, j = opt i, j if opt i, j > opt i−1, j−m + v, opt i−1, j−m + v otherwise, where v = value(p i , a), a ∈ Actions, i ∈ [1, N], j ∈ [0, M].
+To choose between two values, we first check which one has a lower value for attribute KILL The complexity of the dynamic programming is O(N * M), where N is the number of JVMs and M is the total amount of memory.
+On modern servers, M can be large if the memory-size units are fine-grained, which would prevent the manager from making fast decisions.
+At the same time, allocating memory at fine granularity is unnecessary.
+To enable fast memory-allocation decisions, we define U as the unit of memory allocation, and any allocation is represented as a multiple of U.
+We discuss two ways of setting U: as a constant or as a dynamically computed variable based on the current heap state, and evaluate their impact on performance in Section 4.
+Algorithm 1 and Algorithm 2 show the detailed allocation algorithms.
+Function ALLOCATE allocates memory of size M across the list of JVMs, P, at the current timestep, and it returns the best allocation scheme, act best , which is a vector of actions for each p ∈ P.
+The algorithm works as follows: First, we find all the JVMs that are not undergoing a GC as P − P INGC to compute their actions.
+Because the algorithm allocates memory as increments of U, but y limit (p) and o limit (p) of a JVM p at the current timestep may not be increments of U when U is a dynamic variable, we do not include NOOP in Algorithm 2.
+Instead, we consider all the combinations of P − P INGC as potential P NOOP (line 4) and use P = P − (P INGC ∪ P NOOP ) to denote the remaining JVMs.
+The remaining memory to be allocated is of size M (line 7).
+We then apply Algorithm 2 on P and memory of size M (= K units of size U).
+Function KNAPSACK returns the best solution with its value.
+The generation size limits and value of an action on a JVM are computed as in value best = act best = None 3:GROW y used (p) + ˆ grw(p) ˆ y live (p) + o used (p) y cap (p, a) + o cap (p, a) −y limit (p) − o limit (p) os(space(p, a)) YGC y used (p) ˆ y live (p) + o used (p) ˆ y dead (p) ˆ gc y (y ob j (p)) FGC p y used (p) ˆ y live (p) + o used (p) ˆ y dead (p) + ˆ o dead (p) ˆ gc y (y ob j (p)) + ˆ gc o (o ob j (p)) FGC c y used (p) o used (p) ˆ y dead (p) + ˆ o dead (p) ˆ gc y (y ob j (p)) + ˆ gc o (o ob j (p)) * r, r = ( ˆ y live (p) + ˆ o live (p))/ ˆ o live (p) NOOP y limit (p) o limit (p) KILL 0 0P INGC = {p ∈ P, p is undergoing a GC} 4:for P NOOP ∈ power set of P − P INGC do act p = NOOP, p ∈ P NOOP 6:P = P − (P INGC ∪ P NOOP ) 7: M = M − ∑ p∈P INGC ∪P NOOP (y limit (p) + o limit (p)) 8:Compute U, let K = M /U act , value = Knapsack(P , K,U)10:act p = act p , p ∈ P 11:value.cost = value .
+cost, value.KILL = value .
+KILL value.NOOP = size of P NOOP if value > value best then 14:value best = value, act best = act 15:if act best contains only NOOP then Pick P kill ⊆ P, let act best p = KILL, p ∈ P kill return act best align(size,U) = ceiling(size/U).
+For GC actions, we defined a constant mingcsave to avoid GCs that only recycle a negligible amount of space.
+We derive act from the transition actions trans and return them together with the value.
+They are then merged with P NOOP and P INGC to get the final allocation.
+We maintain the best allocation and its value across all the powersets.
+In the end, if the best allocation only contains NOOP actions, we pick some JVMs to kill to make progress.
+In this work, we pick the query that occupies the largest amount of memory and kill all its JVMs, and we leave other strategies as future work.
+The last piece of ElasticMem is the models that estimate JVM values that are necessary for memory allocation decisions yet not directly available as indicated in Table 1.
+To allocate memory to a JVM for the next timestep, the memory manager needs to estimate its memory growth.
+Different approaches are possible.
+In this paper, we adopt opt 0, j = 0, j ∈ [0, K] 4:for i ← 1, N do for j ← 0, K do space(p i , a) < mingcsave then continue 9:y unit = align(y cap (p i , a),U)10:o unit = align(o cap (p i , a),U) 11:if opt i−1, j−y unit −o unit is valid then Derive act p of each p ∈ P from opt N,K and trans N,K return act, opt N,K a simple approach.
+To estimate the heap growth of JVM p at timestep t, ˆ grw(p,t), the manager maintains the maximum change in the young generation's usage during the past b timesteps.
+To be precise, we define: ˆ grw(p,t) = max |y used (p,t ) − y used (p,t − δ t )|,t ∈ [t − b * δ t ,t].
+In our experiments, we set b = 3 empirically.
+We show in Section 4 that this value yields good performance.
+The GC time and space saving depend primarily on the number and total size of the live and dead objects in the collected region.
+Unfortunately, getting such detailed statistics is expensive, as we need to traverse the object reference graph similarly as in a GC.
+Paying such a cost for each JVM at every prediction defeats the purpose of reducing GC costs in the first place.We observe, however, that a query operator's data structures and their update patterns determine the state of live and dead objects, which determines GC times and the amount of reclaimable memory.
+Our approach is thus to monitor the state of major data structures in query operators, collect statistics from them as features, and use these features to build models.
+While there are many operators in a big data system, most keep their state in a small set of data structures, for example, hash tables.
+So instead of changing the operators, we wrap data structures with the functionality to report statistics, and instrument them during query execution to get per-data structure statistics.
+There are many large data structures, but in data analytics systems, the most commonly used ones by operators with large in-memory state, such as join and aggregate, are hash tables.
+In this paper, we focus on the hash table data structure.
+To get predictions for the whole query, we first build models for one hash table, then compute the sum of per-hash-table predictions as the prediction for the whole query.
+Our approach, however, can easily be extended to other data structures and operators.
+Table 3 lists the statistics that we collect for a hash table.
+A hash table stores tuples consist of columns.
+A tuple has a key defined by some columns and a value formed by the remaining columns.
+We collect the number of tuples and keys in a hash table in both generations (both the total and the delta since the previous GC), since new objects are put in the young generation only until a GC.
+These features are nt, ntd, nk and nkd.
+The schema also affects memory consumption.
+In particular, primitive types, such as long, are stored internally using primitive arrays (e.g. long[]) in many systems that optimize memory consumption.
+However, data structures with Java object types, such as String, cannot be handled in the same way, as their representations have large overhead.
+So we treat them separately by introducing features for primitive types (num long ) and String types (num str and sum str ).
+The overhead of getting these values from hash tables is negligible.
+We then build machine learning models to predict the GC times and the total size of live and dead objects as specified in Table 1.
+To build models, our first approach to collect training examples is to randomly trigger GCs during execution to collect statistics.
+The models built from them, however, yielded poor predictions for test points that happen to fall in regions with insufficient training data.
+As a second approach, we collected training data using a coarse-grained multidimensional grid with one dimension per feature.
+The examples were uniformly distributed throughout the feature space but they all had the same small set of distinct feature values, the values from the grid.
+As a result, predictions were excellent for values on the grid but poor otherwise.
+Using a fine-grained grid, however, is too expensive since the feature space has eight dimensions.
+For example, if we divide each dimension in four, the total number of grid points is (4 + 1) 7 = 78, 125.
+Assuming that collecting one data point requires 30 seconds, we need 78, 125/2/60 ≈ 651 machine hours.
+Our final approach is thus to combine the previous two: We first collect data using a coarse-grained grid to ensure uniform coverage of the entire feature space, then for each grid cell, we introduce some diversity by collecting two randomly selected data points inside of it.
+The union of the grid and the random points is the training set.
+To collect a data point for a hash table, we run a query with only that hash table and a synthetically generated dataset as the input.
+This approach enables us to precisely control the feature values when we trigger a GC.
+We then can use any off-the-shelf approach to build a regression model.
+In our implementation, we use the M5P model [40,50] from Weka [20] since it gives us the most accurate predictions overall.
+We evaluate our models in Section 4.2.
+We evaluate the performance of our memory manager and the accuracy of our models.
+We perform all experiments on Amazon EC2 using r3.4xlarge instances.
+We do not set swap space to avoid performance degradation due to virtual memory swapping.
+We execute TPC-H queries [6] on Myria [48], a shared-nothing data management and analytics system written in Java.
+The TPC-H queries are written in MyriaL, which is Myria's declarative query language, and they are publicly available at [7].
+We modify or omit several queries because MyriaL does not support some language features, such as nulls and ORDER BY.
+The final set consists of 17 TPC-H queries: Q1-Q6, Q8-Q12, and Q14-19.
+To experiment with a broad range of query memory consumption, we execute each query on two databases with scale factors one and two.
+We first compare our elastic manager (Elastic) against the original JVM with fixed maximum heap size (Original).
+For Original, we assume that each running JVM gets an equal share of the total memory.
+We pick 4 memoryintensive TPC-H queries, Q4, Q9, Q18, and Q19, and execute each on two databases, which leads to a total of 8 queries.
+In all experiments, we execute these 8 queries on one EC2 instance together with our memory manager.
+All data points are averages of five trials, and we report the minimal and maximal values as floating error bars.
+Each run of the allocation algorithm takes about 0.15 seconds.
+We empirically set the constant mingcsave from Algorithm 2 to 30 MB.
+The value of the function os(m) is obtained by running a calibration program, which asks the operating system for memory of size m using mmap and accesses it using variable assignments.
+We take the system time as os(m).
+For r3.4xlarge, we get os(m) = 0.35s * m 1 GB .
+We set the interval between timesteps, δ t , to 0.5 seconds except in Section 4.1.3, where we compare different values of δ t .
+In order to avoid query hanging due to frequent GCs that do not recycle much memory, we kill a query after 8 minutes if it is still running.
+Based on our observation, 8 minutes is long enough for any query to complete with a reasonable amount of memory.One extreme of Original is serial execution where queries are executed one at a time, while the other extreme is to execute all queries simultaneously.
+The former approach requires the least amount of memory for all queries to complete but takes longer time, while the latter finishes all queries the fastest when memory is sufficient, however may fail more queries when memory is scarce.
+We vary the degree of parallelism (DOP) for Original to compare these alternatives.
+To make it fair for Elastic, we also introduce a variant of Elastic, which allows executions to be delayed by resubmitting killed queries serially after all queries either complete or get killed.
+We call this variant Elastic-Resubmit.
+To avoid livelocks, we only resubmit each killed query once, and each resubmitted query runs only by itself.
+We leave resubmitting multiple queries simultaneously as future work.Another important parameter is the size of the memory increment unit U.
+The value of U can be either fixed or derived in real time.
+We test fixed sizes of 100 MB, 500 MB, and 1000 MB, and variable sizes as 1/8, 1/12, and 1/16 of the total free space at the current timestep.
+First, we submit all queries at the same time.
+Figure 4 shows the elapsed times, together with the numbers of completed queries while varying the total memory size.
+The elapsed times are the times for all queries to complete.
+In this figure, we use U=1/12 as the representative of our elastic manager because it provides the best overall per- formance across all experiments.
+We further discuss the performance of different values of U in Figure 5.
+When memory is abundant (≥ 20 GB), both Elastic managers yield more completed queries and also shorter elapsed times than all the three Original variants.
+When memory is scarce (≤ 15 GB) and only suffices to execute one query at a time, for 15 GB, Elastic-Resubmit is able to complete all queries with less time than Original, DOP=1.
+For 10 GB, it only misses one query with a slightly longer time comparing to DOP=1.
+Based on our observation, the query failed because our manager needs to allocate memory as increments of U, however U is not sufficiently fine-grained.
+The overhead of elapsed time is due to the elastic method striving to accommodate all queries together before degrading to serial execution.
+As a proof of concept, we calculate the in-memory sizes of dominant large hash tables of the 8 queries and find that the sum of them is about 14 GB.
+This experiment shows the advantage of using the elastic manager: it automatically adjusts the degree of parallelism, enabling the system to get high-performance while avoiding out-of-memory failures when possible.
+In Figure 5, we further drill down on the performance of different variants of our approach.
+We seek to determine which variant yields the greatest performance improvement compared with non-elastic memory management.
+Because the elapsed times of Original, DOP=1 are significantly longer than the other two variants, we use Original, DOP=8 as the baseline in this experiment, which also brings fair comparison with our approach.
+We measure performance in terms of total query execution time, which is the sum of the per-query execution times, and total GC time, the sum of the GC times of all queries.
+Figure 5 shows the relative improvement percentages in total query execution time and GC time of Elastic over Original, DOP=8, for different values of U, and also the actual physical memory usage (resident set size, RSS).
+4 Higher bars indicate greater improvements.
+When memory is scarce (≤ 15 GB), Elastic with variable values of U (1/8, 1/12 and 1/16) takes longer to execute each query because it strives to finish more queries than Original, DOP=8, as shown previously in Figure 4.
+When memory is abundant (≥ 20 GB), for any of the values of U, Elastic outperforms Original, DOP=8 on both total query time and GC time.
+The percentage improvements are between 10% and 30% for query time and 40% to 80% for GC time.We observe that it is caused by Original, DOP=8 triggering GCs that do not recycle much space especially in late stages for large queries but being unable to shift memory quota from small queries, while Elastic can dynamically allocate memory across all queries.
+The improvement ratios of query time decrease after 70 GB because GC time takes a less portion of query time when memory is abundant.
+To show the maximum improvement that we can achieve by reducing GC time to zero, we also show the ratios of total GC time to query time in the top subfigure as a reference.
+Finally, the bottom subfigure shows that our elastic manager is also able to utilize a larger fraction of available physical memory to save on GC time and query time.
+Importantly, all values of U, especially the three variable ones, yield similar performance indicating that careful tuning is not required.
+To better simulate a real cluster, instead of issuing all the queries at the same time, we submit the above 8 queries with delays.
+Each query is submitted 30 seconds later than the previous one.
+Figure 6 shows the elapsed times and the numbers of completed queries.
+The patterns are similar to the experiment above with no delay (Figure 4), but also different as Elastic can finish the same number of queries with less time when memory is scarce (10 GB), and always beats all variants of Original in terms of both query completion and elapsed time.
+This is due to the memory flexibility that ElasticMem has: the number of simultaneously running queries is lower when delay is introduced, so Elastic is able to finish more queries faster, while Original stays the same.
+Finally, we evaluate the sensitivity of the approach to different values of δ t varying from 0.1, 0.5, or 1 second for U=500MB and U=1/12.
+We find that when memory is scarce, 0.5 seconds slightly outperforms others by completing more queries with less time, although in general the three δ t s yield similar performance, which indicates that the approach is not sensitive to small differences when using variable sizes of U and thus careful tuning is not necessary.
+We omit details due to space constraints.
+An important component of ElasticMem is its models that predict the GC time and the space that will be freed (Section 3.3).
+We evaluate its models in this section.
+We limit the training space to 12 million tuples and 12 million keys for a hash table, with the schema varying from 1 to 7 long columns and 0 to 8 String columns with a total of 0 to 96 characters.
+This training space is large enough to fit all hash tables from TPC-H queries.
+As described in Section 3.3, we collect approximately 1080 grid points and 1082 random points together as the training set.
+We also collect a test set of 7696 data points by randomly triggering GC for the 17 TPC-H queries on both databases.
+We set the JVM to use one thread for GC (-XX:ParallelGCThreads=1) because we observe that the JVM is not always able to distribute work evenly across multiple GC threads.
+We do not use thread-local buffers (-XX:-UseTLAB).
+We let the JVM always sweep live objects to the beginning of the old generation after each collection (-XX:MarkSweepAlwaysCompactCount=1) instead of every few collections to reduce GC cost variance.
+Among several models available in Weka [20], we pick the M5P model with default settings for its overall accuracy.
+M5P is a decision tree where leaves are linear regressions [40,50].
+We use relative absolute error (RAE) to measure the prediction accuracies.
+5 Figure 7 shows the results for both doing 10-fold cross validation on the training set and testing on the random TPC-H test set.
+For cross validation, the predictions yield RAEs below 5% for every value except o dead .
+For testing, both y dead and o dead cannot be predicted well, while all others have RAEs lower than 25%.
+This is because that 5 The RAE of a list of predictions P i and corresponding real values R i is defined as: the size of dead objects is not strongly correlated with the objects in data structures.
+Fortunately, the fact that the sum of dead and live objects is the total used size gives us a way to avoid predicting y dead and o dead .
+Instead, we letˆy letˆ letˆy dead = y used − ˆ y live andôandˆandô dead = o used − ˆ o live , where y used and o used can be obtained precisely.
+Overall, the prediction error rates are low and, as we showed in Section 4.1, suffice to achieve good memory allocation decisions.
+∑ n i=1 |P i − R i |/ ∑ n i=1 |R − R i |.
+Memory allocation within a single machine: Many approaches focus on sharing memory across multiple objects on a single machine.
+Several techniques have queries as the objects: Some [12,16,38] allocate buffer space across queries based on page access models to reduce page faults.
+Others [11,39] tune buffer allocation policies to meet performance goals in real-time database systems.
+A third set of methods [45] uses application resource sensitivities to guide allocation.
+More recently, Narasayya et al. [37] develop techniques to share a bufferpool across multiple tenants.
+Several approaches focus on operators within a query.
+Anciaux et al. [10] allocate memory across operators on memory-constrained devices.
+Davison et al. [15] sell resources to competing operators to maximize profit.
+Garofalakis et al. [17] schedule operators with multidimensional resource constraints in NUMA systems.
+Finally, Storm et al. [44] manage memory across database system components.
+Although they share the idea of managing memory for multiple objects with a global objective function, the problems are restricted to single machines, and they ignore GC.
+Salomie et al. [41] move memory across JVMs dynamically by adding a balloon space to OpenJDK but have no performance models or scheduling algorithms.
+Ginkgo [26] dynamically manages memory for multiple Java applications by changing layouts using Java Native Interface.
+However, it models performance by profiling specific workloads, while our approach is applicable to arbitrary relational queries.Cluster-wide resource scheduling: Some techniques develop models to understand how resources affect the runtime characteristics of applications.
+Li et al. [32] partition queries on heterogeneous machines based on system calibrations and optimizer statistics.
+Herodotou et al. [23,24] tune Hadoop application parameters based on machine learning models built by job profiles.
+Some other techniques focus on short-lived requests.
+Lang et al. [30] schedule transactional workloads on heterogeneous hardware resources for multiple tenants.
+Schaffner et al. [42] minimize tail latency of tenant response times in column database clusters.
+BlowFish [28] adaptively adjusts storage for performance of random access and search queries by switching between array layers with different sampling rates based on certain thresholds.
+In contrast, our focus is relational queries on Java-based systems with no sampling.
+To provide a unified framework for resource sharing and application scheduling, several general-purpose resource managers have emerged [25,47,51].
+However, they all lack the ability to adjust memory limits dynamically.Adaptive GC tuning: Cook et al.[13] provide two GC triggering policies based on real-time statistics, but do not investigate memory management across applications.
+Simo et al. [43] study the performance impact of JVM heap growth policies by evaluating them on several benchmarks.
+Maas et al. [35] observe that GC coordination is important for distributed applications.
+They let users specify coordination policy to make all JVMs trigger GC at the same time under certain conditions.Region-based memory management: Another line of work uses region-based memory management (RBMM) [46] to avoid GC overhead.
+Broom [18] categorizes Naiad [36] objects into three types with a region assigned to each.
+Deca [34] manipulates Spark Scala objects in-memory representations as byte arrays and allocates pages for them.
+While RBMM may reduce GC overhead, it requires that the programmer declare objectto-region mappings and adds complexity to compilation, without eliminating space safety concerns [21].
+In this paper, we presented ElasticMem, an approach for the automatic and elastic memory management for big data analytics applications running in shared-nothing clusters.
+Our approach includes a technique to dynamically change JVM memory limits, an approach to model memory usage and garbage collection cost during query execution, and a memory manager that performs actions on JVMs to reduce total failures and run times.
+We evaluated our approach in Myria and showed that our approach outperformed static memory allocation both on query failures and execution times.
+We leave extensions to other data structures and experiments with more diverse workloads and systems as future work.

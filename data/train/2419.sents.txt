@@ -1,0 +1,386 @@
+Traditionally, file systems were implemented as part of OS kernels.
+However, as complexity of file systems grew, many new file systems began being developed in user space.
+Nowadays, user-space file systems are often used to prototype and evaluate new approaches to file system design.
+Low performance is considered the main disadvantage of user-space file systems but the extent of this problem has never been explored systematically.
+As a result, the topic of user-space file systems remains rather controversial: while some consider user-space file systems a toy not to be used in production, others develop full-fledged production file systems in user space.
+In this paper we analyze the design and implementation of the most widely known user-space file system framework-FUSE-and characterize its performance for a wide range of workloads.
+We instrumented FUSE to extract useful statistics and traces, which helped us analyze its performance bottlenecks and present our analysis results.
+Our experiments indicate that depending on the workload and hardware used, performance degradation caused by FUSE can be completely imperceptible or as high as-83% even when optimized; and relative CPU utilization can increase by 31%.
+File systems offer a common interface for applications to access data.
+Although micro-kernels implement file systems in user space [1,16], most file systems are part of monolithic kernels [6,22,34].
+Kernel implementations avoid the high message-passing overheads of microkernels and user-space daemons [7,14].
+In recent years, however, user-space file systems rose in popularity for four reasons.
+(1) Several stackable file systems add specialized functionality over existing file systems (e.g., deduplication and compression [19,31]).
+(2) In academia and R&D settings, this framework enabled quick experimentation and prototyping of new approaches [3,9,15,21,40].
+(3) Several existing kernel-level file systems were ported to user space (e.g., ZFS [45], NTFS [25]).
+(4) More companies rely on user-space implementations: IBM'S GPFS [30] and LTFS [26], Nimble Storage's CASL [24], Apache's HDFS [2], Google File System [13], RedHat's GlusterFS [29], Data Domain's DDFS [46], etc.Increased file systems complexity is a contributing factor to user-space file systems' growing popularity (e.g., Btrfs is over 85 KLoC).
+User space code is easier to develop, port, and maintain.
+Kernel bugs can crash whole systems, whereas user-space bugs' impact is more contained.
+Many libraries and programming languages are available in user-space in multiple platforms.Although user-space file systems are not expected to displace kernel file systems entirely, they undoubtedly occupy a growing niche, as some of the more heated debates between proponents and opponents indicate [20,39,41].
+The debates center around two tradeoff factors: (1) how large is the performance overhead caused by a user-space implementations and (2) how much easier is it to develop in user space.
+Ease of development is highly subjective, hard to formalize and therefore evaluate; but performance is easier to evaluate empirically.
+Oddly, little has been published on the performance of user-space file system frameworks.In this paper we use a popular user-space file system framework, FUSE, and characterize its performance.
+We start with a detailed explanation of FUSE's design and implementation for four reasons: (1) the architecture is somewhat complex; (2) little information on internals is available publicly; (3) FUSE's source code can be difficult to analyze, with complex asynchrony and userkernel communications; and (4) as FUSE's popularity grows, a detailed analysis of its implementation becomes of high value to many.We developed a simple pass-through stackable file system in FUSE and then evaluated its performance when layered on top of Ext4 compared to native Ext4.
+We used a wide variety of micro-and macro-workloads, and different hardware using basic and optimized configurations of FUSE.
+We found that depending on the workload and hardware, FUSE can perform as well as Ext4, but in the worst cases can be 3× slower.
+Next, we designed and built a rich instrumentation system for FUSE to gather detailed performance metrics.
+The statistics extracted are applicable to any FUSE-based systems.
+We then used this instrumentation to identify bottlenecks in FUSE, and to explain why, for example, its performance varied greatly for different workloads.
+FUSE-thanks mainly to the simple API it provideslittle work was done on understanding its internal architecture, implementation, and performance [27].
+For our evaluation it was essential to understand not only FUSE's high-level design but also some details of its implementation.
+In this section we first describe FUSE's basics and then we explain certain important implementation details.
+FUSE is available for several OSes: we selected Linux due to its wide-spread use.
+We analyzed the code of and ran experiments on the latest stable version of the Linux kernel available at the beginning of the project-v4.1.13.
+We also used FUSE library commit #386b1b; on top of FUSE v2.9.4, this commit contains several important patches which we did not want exclude from our evaluation.
+We manually examined all new commits up to the time of this writing and confirmed that no new major features or improvements were added to FUSE since the release of the selected versions.
+FUSE consists of a kernel part and a user-level daemon.
+The kernel part is implemented as a Linux kernel module that, when loaded, registers a fuse file-system driver with Linux's VFS.
+This Fuse driver acts as a proxy for various specific file systems implemented by different user-level daemons.
+In addition to registering a new file system, FUSE's kernel module also registers a /dev/fuse block device.
+This device serves as an interface between userspace FUSE daemons and the kernel.
+In general, daemon reads FUSE requests from /dev/fuse, processes them, and then writes replies back to /dev/fuse.
+Figure 1 shows FUSE's high-level architecture.
+When a user application performs some operation on a mounted FUSE file system, the VFS routes the operation to FUSE's kernel driver.
+The driver allocates a FUSE request structure and puts it in a FUSE queue.
+At this point, the process that submitted the operation is usually put in a wait state.
+FUSE's user-level daemon then picks the request from the kernel queue by reading from /dev/fuse and processes the request.
+Processing the request might require re-entering the kernel again: for example, in case of a stackable FUSE file system, the daemon submits operations to the underlying file system (e.g., Ext4); or in case of a block-based FUSE file system, the daemon reads or writes from the block device.
+When done with processing the request, the FUSE daemon writes the response back to /dev/fuse; FUSE's kernel driver then marks the request as completed and wakes up the original user process.Some file system operations invoked by an application can complete without communicating with the user-level FUSE daemon.
+For example, reads from a file whose pages are cached in the kernel page cache, do not need to be forwarded to the FUSE driver.
+We now discuss several important FUSE implementation details: the user-kernel protocol, library and API levels, in-kernel FUSE queues, splicing, multithreading, and write-back cache.
+User-kernel protocol.
+When FUSE's kernel driver communicates to the user-space daemon, it forms a FUSE request structure.
+Requests have different types depending on the operation they convey.
+Table 1 lists all 43 FUSE request types, grouped by their semantics.
+As seen, most requests have a direct mapping to traditional VFS operations: we omit discussion of obvious requests (e.g., READ, CREATE) and instead next focus on those less intuitive request types (marked bold in Table 1).
+The INIT request is produced by the kernel when a file system is mounted.
+At this point user space and kernel negotiate (1) the protocol version they will operate on (7.23 at the time of this writing), (2) the set of mutually supported capabilities (e.g., READDIRPLUS or FLOCK support), and (3) various parameter settings (e.g., FUSE read-ahead size, time granularity).
+Conversely, the DESTROY request is sent by the kernel during the file system's unmounting process.
+When getting a DE-STROY, the daemon is expected to perform all necessary cleanups.
+No more requests will come from the kernel for this session and subsequent reads from /dev/fuse will return 0, causing the daemon to exit gracefully.The INTERRUPT request is emitted by the kernel if any previously sent requests are no longer needed (e.g., when a user process blocked on a READ is terminated).
+Each request has a unique sequence# which INTERRUPT uses to identify victim requests.
+Sequence numbers are assigned by the kernel and are also used to locate completed requests when the user space replies.Every request also contains a node ID-an unsigned 64-bit integer identifying the inode both in kernel and user spaces.
+The path-to-inode translation is performed by the LOOKUP request.
+Every time an existing inode is looked up (or a new one is created), the kernel keeps the inode in the inode cache.
+When removing an inode from the dcache, the kernel passes the FORGET request to the user-space daemon.
+At this point the daemon might decide to deallocate any corresponding data structures.
+BATCH FORGET allows kernel to forget multiple inodes with a single request.An OPEN request is generated, not surprisingly, when a user application opens a file.
+When replying to this request, a FUSE daemon has a chance to optionally assign a 64-bit file handle to the opened file.
+This file handle is then returned by the kernel along with every request associated with the opened file.
+The user-space daemon can use the handle to store per-opened-file information.
+E.g., a stackable file system can store the descriptor of the file opened in the underlying file system as part of FUSE's file handle.
+FLUSH is generated every time an opened file is closed; and RELEASE is sent when there are no more references to a previously opened file.OPENDIR and RELEASEDIR requests have the same semantics as OPEN and RELEASE, respectively, but for directories.
+The READDIRPLUS request returns one or more directory entries like READDIR, but it also includes metadata information for each entry.
+This allows the kernel to pre-fill its inode cache (similar to NFSv3's READ-DIRPLUS procedure [4]).
+When the kernel evaluates if a user process has permissions to access a file, it generates an ACCESS request.
+By handling this request, the FUSE daemon can implement custom permission logic.
+However, typically users mount FUSE with the default permissions option that allows kernel to grant or deny access to a file based on its standard Unix attributes (ownership and permission bits).
+In this case no ACCESS requests are generated.
+Library and API levels.
+Conceptually, the FUSE library consists of two levels.
+The lower level takes care of (1) receiving and parsing requests from the kernel, (2) sending properly formatted replies, (3) facilitating file system configuration and mounting, and (4) hiding potential version differences between kernel and user space.
+This part exports the low-level FUSE API.The High-level FUSE API builds on top of the lowlevel API and allows developers to skip the implementation of the path-to-inode mapping.
+Therefore, neither inodes nor lookup operations exist in the high-level API, easing the code development.
+Instead, all high-level API methods operate directly on file paths.
+The high-level API also handles request interrupts and provides other convenient features: e.g., developers can use the more common chown(), chmod(), and truncate() methods, instead of the lower-level setattr().
+File system developers must decide which API to use, by balancing flexibility vs. development ease.
+Queues.
+In Section 2.1 we mentioned that FUSE's kernel has a request queue.
+FUSE actually maintains five queues as seen in Figure 2: (1) interrupts, (2) forgets, (3) pending, (4) processing, and (5) background.
+A request belongs to only one queue at any time.
+FUSE puts INTERRUPT requests in the interrupts queue, FOR-GET requests in the forgets queue, and synchronous requests (e.g., metadata) in the pending queue.
+When a file-system daemon reads from /dev/fuse, requests are transferred to the user daemon as follows: (1) Priority is given to requests in the interrupts queue; they are transferred to the user space before any other request.
+(2) FORGET and non-FORGET requests are selected fairly: for each 8 non-FORGET requests, 16 FOR-GET requests are transferred.
+This reduces the burstiness of FORGET requests, while allowing other requests to proceed.
+The oldest request in the pending queue is transferred to the user space and simultaneously moved to the processing queue.
+Thus, processing queue requests are currently processed by the daemon.
+If the pending queue is empty then the FUSE daemon is blocked on the read call.
+When the daemon replies to a request (by writing to /dev/fuse), the corresponding request is removed from the processing queue.The background queue is for staging asynchronous requests.
+In a typical setup, only read requests go to the background queue; writes go to the background queue too but only if the writeback cache is enabled.
+In such configurations, writes from the user processes are first accumulated in the page cache and later bdflush threads wake up to flush dirty pages [8].
+While flushing the pages FUSE forms asynchronous write requests and puts them in the background queue.
+Requests from the background queue gradually trickle to the pending queue.
+FUSE limits the number of asynchronous requests simultaneously residing in the pending queue to the configurable max background parameter (12 by default).
+When fewer than 12 asynchronous requests are in the pending queue, requests from the background queue are moved to the pending queue.
+The intention is to limit the delay caused to important synchronous requests by bursts of background requests.The queues' lengths are not explicitly limited.
+However, when the number of asynchronous requests in the pending and processing queues reaches the value of the tunable congestion threshold parameter (75% of max background, 9 by default), FUSE informs the Linux VFS that it is congested; the VFS then throttles the user processes that write to this file system.
+Splicing and FUSE buffers.
+In its basic setup, the FUSE daemon has to read() requests from and write() replies to /dev/fuse.
+Every such call requires a memory copy between the kernel and user space.
+It is especially harmful for WRITE requests and READ replies because they often process a lot of data.
+To alleviate this problem, FUSE can use splicing functionality provided by the Linux kernel [38].
+Splicing allows the user space to transfer data between two inkernel memory buffers without copying the data to user space.
+This is useful, e.g., for stackable file systems that pass data directly to the underlying file system.To seamlessly support splicing, FUSE represents its buffers in one of two forms: (1) a regular memory region identified by a pointer in the user daemon's address space, or (2) a kernel-space memory pointed by a file descriptor.
+If a user-space file system implements the write buf() method, then FUSE splices the data from /dev/fuse and passes the data directly to this method in a form of the buffer containing a file descriptor.
+FUSE splices WRITE requests that contain more than a single page of data.
+Similar logic applies to replies to READ requests with more than two pages of data.
+Multithreading.
+FUSE added multithreading support as parallelism got more popular.
+In multi-threaded mode, FUSE's daemon starts with one thread.
+If there are two or more requests available in the pending queue, FUSE automatically spawns additional threads.
+Every thread processes one request at a time.
+After processing the request, each thread checks if there are more than 10 threads; if so, that thread exits.
+There is no explicit upper limit on the number of threads created by the FUSE library.
+An implicit limit exists for two reasons: (1) by default, only 12 asynchronous requests (max background parameter) can be in the pending queue at one time; and (2) the number of synchronous requests in the pending queue depends on the total amount of I/O activity generated by user processes.
+In addition, for every INTERRUPT and FORGET requests, a new thread is invoked.
+In a typical system where there is no interrupts support and few FORGETs are generated, the total number of FUSE daemon threads is at most (12 + number of requests in pending queue).
+Write back cache and max writes.
+The basic write behavior of FUSE is synchronous and only 4KB of data is sent to the user daemon for writing.
+This results in performance problems on certain workloads; when copying a large file into a FUSE file system, /bin/cp indirectly causes every 4KB of data to be sent to userspace synchronously.
+The solution FUSE implemented was to make FUSE's page cache support a write-back policy and then make writes asynchronous.
+With that change, file data can be pushed to the user daemon in larger chunks of max write size (limited to 32 pages).
+To study FUSE's performance, we developed a simple stackable passthrough file system-called Stackfs-and instrumented FUSE's kernel module and user-space library to collect useful statistics and traces.
+We believe that the instrumentation presented here is useful for anyone who develops a FUSE-based file system.
+Stackfs is a file system that passes FUSE requests unmodified directly to the underlying file system.
+The reason for Stackfs was twofold.
+(1) After examining the code of all publicly available [28,43] FUSE-based file systems, we found that most of them are stackable (i.e., deployed on top of other, often in-kernel file systems).
+(2) We wanted to add as little overhead as possible, to isolate the overhead of FUSE's kernel and library.Complex production file systems often need a high degree of flexibility, and thus use FUSE's low-level API.
+As such file systems are our primary focus, we implemented Stackfs using FUSE's low-level API.
+This also avoided the overheads added by the high-level API.
+Below we describe several important data structures and procedures that Stackfs uses.Inode.
+Stackfs stores per-file metadata in an inode.
+Stackfs's inode is not persistent and exists in memory only while the file system is mounted.
+Apart from bookkeeping information, the inode stores the path to the underlying file, its inode number, and a reference counter.The path is used, e.g., to open the underlying file when an OPEN request for a Stackfs file arrives.
+Lookup.
+During lookup, Stackfs uses stat(2) to check if the underlying file exists.
+Every time a file is found, Stackfs allocates a new inode and returns the required information to the kernel.
+Stackfs assigns its inode the number equal to the address of the inode structure in memory (by typecasting), which is guaranteed to be unique.
+This allows Stackfs to quickly find the inode structure for any operations following the lookup (e.g., open or stat).
+The same inode can be looked up several times (e.g., due to hardlinks) and therefore Stackfs stores inodes in a hash table indexed by the underlying inode number.
+When handling LOOKUP, Stackfs checks the hash table to see whether the inode was previously allocated and, if found, increases its reference counter by one.
+When a FORGET request arrives for an inode, Stackfs decreases inode's reference count and deallocates the inode when the count drops to zero.File create and open.
+During file creation, Stackfs adds a new inode to the hash table after the corresponding file was successfully created in the underlying file system.
+While processing OPEN requests, Stackfs saves the file descriptor of the underlying file in the file handle.
+The file descriptor is then used during read and write operations and deallocated when the file is closed.
+The existing FUSE instrumentation was insufficient for in-depth FUSE performance analysis.
+We therefore instrumented FUSE to export important runtime statistics.
+Specifically, we were interested in recording the duration of time that FUSE spends in various stages of request processing, both in kernel and user space.We introduced a two-dimensional array where a row index (0-42) represents the request type and the column index (0-31) represents the time.
+Every cell in the array stores the number of requests of a corresponding type that were processed within the 2 N +1 -2 N +2 nanoseconds where N is the column index.
+The time dimension therefore covers the interval of up to 8 seconds which is enough in typical FUSE setups.
+(This technique efficiently records a log 2 latency histogram [18].)
+We then added four such arrays to FUSE: the first three arrays are in the kernel, capturing the time spent by the request inside the background, pending, and processing queues.
+For the processing queue, the captured time also includes the time spent by requests in user space.
+The fourth array is in user space and tracks the time the daemon needs to process a request.
+The total memory size of all four arrays is only 48KiB and only few instructions are necessary to update values in the array.FUSE includes a special fusectl file system to allow users to control several aspects of FUSE's behavior.
+This file system is usually mounted at /sys/fs/fuse/connections/ and creates a directory for every mounted FUSE instance.
+Every directory contains control files to abort a connection, check the total number of requests being processed, and adjust the upper limit and the threshold on the number of background requests (see Section 2.2).
+We added 3 new files to these directories to export statistics from the in-kernel arrays.
+To export user-level array we added SIGUSR1 signal handler to the daemon.
+When triggered, the handler prints the array to a log file specified during the daemon's start.
+The statistics captured have no measurable overhead on FUSE's performance and are the primary source of information about FUSE's performance.
+Tracing.
+To understand FUSE's behavior in more detail we sometimes needed more information and had to resort to tracing.
+FUSE's library already performs tracing when the daemon runs in debug mode but there is no tracing support for FUSE's kernel module.
+We used Linux's static tracepoint mechanism [10] to add over 30 tracepoints mainly to monitor the formation of requests during the complex writeback logic, reads, and some metadata operations.
+Tracing helped us learn how fast queues grow during our experiments, how much data is put into a single request, and why.Both FUSE's statistics and tracing can be used by any existing and future FUSE-based file systems.
+The instrumentation is completely transparent and requires no changes to file-system-specific code.
+FUSE has evolved significantly over the years and added several useful optimizations: writeback cache, zerocopy via splicing, and multi-threading.
+In our personal experience, some in the storage community tend to pre-judge FUSE's performance-assuming it is poormainly due to not having information about the improvements FUSE made over the years.
+We therefore designed our methodology to evaluate and demonstrate how FUSE's performance advanced from its basic configurations to ones that include all of the latest optimizations.
+We now detail our methodology, starting from the description of FUSE configurations, proceed to the list of workloads, and finally present our testbed.
+FUSE configurations.
+To demonstrate the evolution of FUSE's performance, we picked two configurations on opposite ends of the spectrum: the basic configuration (called StackfsBase) with no major FUSE optimizations and the optimized configuration (called StackfsOpt) that enables all FUSE improvements available as of this writing.
+Compared to StackfsBase, the StackfsOpt configuration adds the following features: (1) writeback cache is turned on; (2) maximum size of a single FUSE request is increased from 4KiB to 128KiB (max write parameter); (3) user daemon runs in the multi-threaded mode; (4) splicing is activated for all operations (splice read, splice write, and splice move parameters).
+We left all other parameters at their default values in both configurations.
+Workloads.
+To stress different modes of FUSE operation and conduct an thorough performance characterization, we selected a broad set of workloads: micro and macro, metadata-and data-intensive, and also experimented with a wide range of I/O sizes and parallelism levels.
+Table 2 describes all workloads that we employed.
+To simplify the identification of workloads in the text we use the following mnemonics: rnd stands for random, seq for sequential, rd for reads, wr for writes, cr for creates, and del for deletes.
+The presence of N th and M f substrings in a workload name means that the workload contains N threads and M files, respectively.
+We fixed the amount of work (e.g., the number of reads in rd workloads) rather than the amount of time in every experiment.
+We find it easier to analyze performance in experiments with a fixed amount of work.
+We picked a sufficient amount of work so that the performance stabilized.
+Resulting runtimes varied between 8 and 20 minutes across the experiments.
+Because SSDs are orders of magnitude faster than HDDs, for some workloads we selected a larger amount of work for our SSD-based experiments.
+We used Filebench [12,37] to generate all workloads.
+Experimental setup.
+FUSE performance depends heavily on the speed of the underlying storage: faster devices expose FUSE's own overheads.
+We therefore experimented with two common storage devices of different speed: an HDD (Seagate Savvio 15K.2, 15KRPM, 146GB) and an SSD (Intel X25-M SSD, 200GB).
+Both devices were installed in three identical Dell PowerEdge R710 machines with 4-core Intel Xeon E5530 2.40GHz CPU each.
+The amount of RAM available to the OS was set to 4GB to accelerate cache warmup in our experiments.
+The machines ran CentOS 7 with Linux kernel upgraded to v4.1.13 and FUSE library commit #386b1b.
+We used Ext4 [11] as the underlying file system because it is common, stable, and has a well documented design which facilitates performance analysis.
+Before every experiment we reformatted the storage devices with Ext4 and remounted the file systems.
+To lower the variability in our experiments we disabled Ext4's lazy inode initialization [5].
+In either case, standard deviations in our experiments were less than 2% for all workloads except for three: seq-rd-1th-1f (6%), files-rd-32th (7%), and mail-server (7%).
+For many, FUSE is just a practical tool to build real products or prototypes, but not a research focus.
+To present our results more effectively, we split the evaluation in two.
+Section 5.1 overviews our extensive evaluation results-most useful information for many practitioners.
+Detailed performance analysis follows in Section 5.2.
+To evaluate FUSE's performance degradation, we first measured the throughput (in ops/sec) achieved by native Ext4 and then measured the same for Stackfs deployed over Ext4.
+As detailed in Section 4 we used two configurations of Stackfs: a basic (StackfsBase) and optimized (StackfsOpt) one.
+From here on, we use Stackfs to refer to both of these configurations.
+We then calculated the relative performance degradation (or improvement) of Stackfs vs. Ext4 for each workload.
+Table 3 shows absolute throughputs for Ext4 and relative performance for two Stackfs configurations for both HDD and SSD.For better clarity we categorized the results by Stackfs's performance difference into four classes: (1) The Green class (marked with + ) indicates that the performance either degraded by less than 5% or actually improved; (2) The Yellow class ( * ) includes results with the performance degradation in the 5-25% range; (3) The Orange class ( # ) indicates that the performance degradation is between 25-50%; And finally, (4) the Red class ( ! )
+is for when performance decreased by more than 50%.
+Although the ranges for acceptable performance degradation depend on the specific deployment and the value of other benefits provided by FUSE, our classification gives a broad overview of FUSE's performance.
+Below we list our main observations that characterize the results.
+We start from the general trends and move to more specific results towards the end of the list.
+Observation 2.
+For many workloads, FUSE's optimizations improve performance significantly.
+E.g., for the web-server workload, StackfsOpt improves performance by 6.2% while StackfsBase degrades it by more than 50% [row #45].
+Observation 3.
+Although optimizations increase the performance of some workloads, they can degrade the performance of others.
+E.g., StackfsOpt decreases performance by 35% more than StackfsBase for the files-rd-1th workload on SSD [row #39].
+Results seq-rd-N th-1f N threads (1, 32) sequentially read from a single preallocated 60GB file.
+[rows #1-8] seq-rd-32th-32f 32 threads sequentially read 32 preallocated 2GB files.
+Each thread reads its own file.
+[rows #9-12] rnd-rd-N th-1f N threads (1, 32) randomly read from a single preallocated 60GB file.
+[rows #13-20] seq-wr-1th-1fSingle thread creates and sequentially writes a new 60GB file.
+[rows #21-24] seq-wr-32th-32f 32 threads sequentially write 32 new 2GB files.
+Each thread writes its own file.
+[rows #25-28] rnd-wr-N th-1f N threads (1, 32) randomly write to a single preallocated 60GB file.
+[rows #29-36] files-cr-N th N threads (1, 32) create 4 million 4KB files over many directories.
+[rows #37-38] files-rd-N th N threads (1, 32) read from 1 million preallocated 4KB files over many directories.
+[rows #39-40] files-del-N th N threads (1, 32) delete 4 million of preallocated 4KB files over many directories.
+[rows #41-42] file-server File-server workload emulated by Filebench.
+Scaled up to 200,000 files.
+[row #43] mail-serverMail-server workload emulated by Filebench.
+Scaled up to 1.5 million files.
+[row #44] web-serverWeb-server workload emulated by Filebench.
+Scaled up to 1.25 million files.
+[row #45] We analyzed FUSE performance results and present main findings here, following the order in Table 3.
+Figure 3 demonstrates the types of requests that were generated with the seq-rd-32th-32f workload.
+We use seq-rd-32th-32f as a reference for the figure because this workload has more requests per operation type compared to other workloads.
+Bars are ordered from left to right by the appearance of requests in the experiment.
+The same request types, but in different quantities, were generated by the other read-intensive workloads [rows #1 -20].
+For the single threaded read workloads, only one request per LOOKUP, OPEN, FLUSH, and RELEASE type was generated.
+The number of READ requests depended on the I/O size and the amount of data read; INIT request is produced at mount time so its count remained the same across all workloads; and finally GETATTR is invoked before unmount for the root directory and was the same for all the workloads.
+Table 3: List of workloads and corresponding performance results.
+Green class (marked with + ) indicates that the performance either degraded by less than 5% or actually improved; Yellow class ( * ) includes results with the performance degradation in the 5-25% range; Orange class ( # ) indicates that the performance degradation is between 25-50%; And finally, the Red class ( ! )
+is for when performance decreased by more than 50%.
+I N I T L O O K U P O P E N R E A D F L U S H R E L E A S E G E T A T TSequential Read using 1 thread on 1 file.
+The total number of READ requests that StackfsBase generated during the whole experiment for different I/O sizes for HDD and SSD remained approximately the same and equal to 491K.
+Our analysis revealed that this happens because of FUSE's default 128KB-size readahead which effectively levels FUSE request sizes no matter what is the user application I/O size.
+Thanks to readahead, sequential read performance of StackfsBase and StackfsOpt was as good as Ext4 for both HDD and SSD.
+Sequential Read using 32 threads on 32 files.
+Due to readahead, the total number of READ requests generated here was also approximately same for different I/O sizes.
+At any given time, 32 threads are requesting data and continuously add requests to queues.
+StackfsBase and StackfsOpt show significantly larger performance degradation on HDD compared to SSD.
+For StackfsBase, the user daemon is single threaded and the device is slower, so requests do not move quickly through the queues.
+On the faster SSD, however, even though the user daemon is single threaded, requests move faster in the queues.Hence performance of StackfsBase is as close to that of Ext4.
+With StackfsOpt, the user daemon is multithreaded and can fill the HDD's queue faster so performance improved for HDD compared to SSD.
+Investigating further, we found that for HDD and StackfsOpt, FUSE's daemon was bound by the max background value (default is 12): at most, only 12 user deamons (threads) were spawned.
+We increased that limit to 100 and reran the experiments: now StackfsOpt was within 2% of Ext4's performance.
+Sequential Read using 32 threads on 1 file.
+This workload exhibits similar performance trends to seq-rd-1th-1f.
+However, because all 32 user threads read from the same file, they benefit from the shared page cache.
+As a result, instead of 32× more FUSE requests, we saw only up to a 37% increase in number of requests.
+This modest increase is because, in the beginning of the experiment, every thread tries to read the data separately; but after a certain point in time, only a single thread's requests are propagated to the user daemon while all other threads' requests are available in the page cache.
+Also, having 32 user threads running left less CPU time available for FUSE's threads to execute, thus causing a slight (up to 4.4%) decrease in performance compared to Ext4.
+Random Read using 1 thread on 1 file.
+Unlike the case of small sequential reads, small random reads did not benefit from FUSE's readahead.
+Thus, every application read call was forwarded to the user daemon which resulted in an overhead of up to 10% for HDD and 40% for SSD.
+The absolute Ext4 throughput is about 20× higher for SSD than for HDD which explains the higher penalty on FUSE's relative performance on SSD.The smaller the I/O size is, the more READ requests are generated and the higher FUSE's overhead tended to be.
+This is seen for StackfsOpt where performance for HDD gradually grows from -10.0% for 4KB to -3% for 1MB I/O sizes.
+A similar situation is seen for SSD.
+Thanks to splice, StackfsOpt performs better than StackfsBase for large I/O sizes.
+For 1MB I/O size, the improvement is 6% on HDD and 14% on SSD.
+Interestingly, 4KB I/O sizes have the highest overhead because FUSE splices requests only if they are larger than 4KB.
+Random Read using 32 threads on 1 file.
+Similar to the previous experiment (single thread random read), readahead does not help smaller I/O sizes here: every user read call is sent to the user daemon and causes high performance degradation: up to -83% for StackfsBase and -28% for StackfsOpt.
+The overhead caused by StackfsBase is high in these experiments (up to -60% for HDD and -83% for SSD), for both HDD and SSD, and especially for smaller I/O sizes.
+This is because when 32 user threads submit a READ request, 31 of those threads need to wait while the single-threaded user daemon processes one request at a time.
+StackfsOpt reduced performance degradation compared to StackfsBase, but not as much for 4KB I/Os because splice is not used for request that are smaller or equal to 4KB.
+We now discuss the behavior of StackfsBase and StackfsOpt in all write workloads listed in Table 3 [rows #21-36].
+Figure 4 shows the different types of requests that got generated during all write workloads, from left to right in their order of generation (seq-wr-32th-32f is used as a reference).
+In case of rnd-wr workloads, CREATE requests are replaced by OPEN requests, as random writes operate on preallocated files.
+For all the seq-wr workloads, due to the creation of files, a GETATTR request was generated to check permissions of the single directory where the files were created.
+Linux VFS caches attributes and therefore there were fewer than 32 GETATTRs workloads, five operations generated only one request: LOOKUP, OPEN, CREATE, FLUSH, and RELEASE; however, the number of WRITE requests was orders of magnitude higher and depended on the amount of data written.
+Therefore, we consider only WRITE requests when we discuss each workload in detail.
+IN IT L O O K U P G E T A T T R C R E A T E G E T X A T T R W R IT E F L U S H R E L E A SUsually the Linux VFS generates GETXATTR before every write operation.
+But in our case StackfsBase and StackfsOpt did not support extended attributes and the kernel cached this knowledge after FUSE returned ENOSUPPORT for the first GETXATTR.
+Sequential Write using 1 thread on 1 file.
+The total number of WRITE requests that StackfsBase generated during this experiment was 15.7M for all I/O sizes.
+This is because in StackfsBase each user write call is split into several 4KB-size FUSE requests which are sent to the user daemon.
+As a result StackfsBase degraded performance ranged from -26% to -9%.
+Compared to StackfsBase, StackfsOpt generated significantly fewer FUSE requests: between 500K and 563K depending on the I/O size.
+The reason is the writeback cache that allows FUSE's kernel part to pack several dirty pages (up to 128KB in total) into a single WRITE request.
+Approximately 1 32 of requests were generated in StackfsOpt compared to StackfsBase.
+This suggests indeed that each WRITE request transferred about 128KB of data (or 32× more than 4KB).
+Table 4 shows the breakdown of time spent (latencies) by a single write request across various stages, during the seq-wr-4KB-1th-1f workload on HDD.
+Taking only major latencies, the write request spends 19% of its time in request creation and waiting in the kernel queues; 43% of its time in user space, which includes time taken by the underlying Ext4 to serve the write; and then 23% of time during copy of the response from user space to kernel.
+The relative CPU utilization caused by StackfsBase and StackfsOpt in seq-wr-4KB-1th-1f on HDD is 6.8% and 11.1% more than native Ext4, respectively; CPU cycles per operation were the same for StackfsBase and StackfsOpt-4× that of native Ext4.Sequential Write using 32 threads on 32 files.
+Performance trends are similar to seq-wr-1th-1f but even the unoptimized StackfsBase performed much better (up to -2.7% and -0.1% degradation for HDD and SSD, respectively).
+This is because without the writeback cache, 32 user threads put more requests into FUSE's queues (compared to 1 thread) and therefore kept the user daemon constantly busy.
+Random Write using 1 thread on 1 file.
+Performance degradation caused by StackfsBase and StackfsOpt was low on HDD for all I/O sizes (max -1.3%) because the random write performance of Ext4 on HDD is lowbetween 79 and 1,074 Filebench ops/sec, depending on the I/O size (compare to over 16,000 ops/sec for SSD).
+The performance bottleneck, therefore, was in the HDD I/O time and FUSE overhead was invisible.Interestingly, on SSD, StackfsOpt performance degradation was high (-27% for 4KB I/O) and more than the StackfsBase for 4KB and 32KB I/O sizes.
+The reason for this is that currently FUSE's writeback cache batches only sequential writes into a single WRITE.
+Therefore, in the case of random writes there is no reduction in the number of WRITE requests compared to StackfsBase.
+These numerous requests are processed asynchronously (i.e., added to the background queue).
+And because of FUSE's congestion threshold on the background queue the application that is writing the data becomes throttled.For I/O size of 32KB, StackfsOpt can pack the entire 32KB into a single WRITE request.
+Compared to StackfsBase, this reduces the number of WRITE requests by 8× and results in 15% better performance.
+Random Write using 32 threads on 1 file.
+This workload performs similarly to rnd-wr-1th-1f and the same analysis applies.
+We now discuss the behavior of Stackfs in all metadata micro-workloads as listed in Table 3 [rows #37-42].
+File creates.
+Different types of requests that got generated during the files-cr-N th runs are GETATTR, LOOKUP, CREATE, WRITE, FLUSH, RELEASE, and FOR-GET.
+The total number of each request type generated was exactly 4 million.
+Many GETATTR requests were generated due to Filebench calling a fstat on the file to check whether it exists or not before creating it.
+Files-cr-N th workloads demonstrated the worst performance among all workloads for both StackfsBase and StackfsOpt and for both HDD and SSD.
+The reason is twofold.
+First, for every single file create, five operations happened serially: GETATTR, LOOKUP, CRE-ATE, WRITE, and FLUSH; and as there were many files accessed, they all could not be cached, so we saw many FORGET requests to remove cached items-which added further overhead.
+Second, file creates are fairly fast in 0 500000 1e+06 1.5e+062e+06 2.5e+06 I N I T L O O K U P O P E N G E T A T T R R E A D F L U S H R E L E A S E F O R G E T Types of FUSE Requests 1 1M 1M 1M 1M 2M 1M 1M 780K background queue pending queue processing queue user daemon Figure 5: Different types of requests that were generated by StackfsBase on SSD for the files-rd-1th workload, from left to right in their order of generation.Ext4 (30-46 thousand creates/sec) because small newly created inodes can be effectively cached in RAM.
+Thus, overheads caused by the FUSE's user-kernel communications explain the performance degradation.File Reads.
+Figure 5 shows different types of requests that got generated during the files-rd-1th workload.
+This workload is metadata-intensive because it contains many small files (one million 4KB files) that are repeatedly opened and closed.
+Figure 5 shows that half of the READ requests went to the background queue and the rest directly to the pending queue.
+The reason is that when reading a whole file, and the application requests reads beyond the EOF, FUSE generates a synchronous READ request which goes to the pending queue (not the background queue).
+Reads past the EOF also generate a GETATTR request to confirm the file's size.
+The performance degradation for files-rd-1th in StackfsBase on HDD is negligible; on SSD, however, the relative degradation is high (-25%) because the SSD is 12.5× faster than HDD (see Ext4 absolute throughput in Table 3).
+Interestingly, StackfsOpt's performance degradation is more than that of StackfsBase (by 10% and 35% for HDD and SSD, respectively).
+The reason is that in StackfsOpt, different FUSE threads process requests for the same file, which requires additional synchronization and context switches.
+Conversely, but as expected, for files-rd-32th workload, StackfsOpt performed 40-45% better than StackfsBase because multiple threads are needed to effectively process parallel READ requests.File Deletes.
+The different types of operations that got generated during the files-del-1th workloads are LOOKUP, UNLINK, FORGET (exactly 4 million each).
+Every UNLINK request is followed by FORGET.
+Therefore, for every incoming delete request that the application (Filebench) submits, StackfsBase and StackfsOpt generates three requests (LOOKUP, UNLINK, and FOR-GET) in series, which depend on each other.Deletes translate to small random writes at the block layer and therefore Ext4 benefited from using an SSD (7-8× higher throughput than the HDD).
+This negatively impacted Stackfs in terms of relative numbers: its performance degradation was 25-50% higher on SSD than on HDD.
+In all cases StackfsOpt's performance degradation is more than StackfsBase's because neither splice nor the writeback cache helped files-del-N th workloads and only added additional overhead for managing extra threads.
+We now discuss the behavior of Stackfs for macroworkloads [rows #43-45].
+File Server.
+Figure 6 shows different types of operations that got generated during the file-server workload.
+Macro workloads are expected to have a more diverse request profile than micro workloads, and file-server confirms this: many different requests got generated, with WRITEs being the majority.
+The performance improved by 25-40% (depending on storage device) with StackfsOpt compared to StackfsBase, and got close to Ext4's native performance for three reasons: (1) with a writeback cache and 128KB requests, the number of WRITEs decreased by a factor of 17× for both HDD and SSD, (2) with splice, READ and WRITE requests took advantage of zero copy, and (3) the user daemon is multi-threaded, as the workload is.
+Mail Server.
+Figure 7 shows different types of operations that got generated during the mail-server workload.
+As with the file-server workload, many different requests got generated, with WRITEs being the majority.
+Performance trends are also similar between these two workloads.
+However, in the SSD setup, even the optimized StackfsOpt still did not perform close to Ext4 in this mail-server workload, compared to file-server.
+The reason is twofold.
+First, compared to file server, mail server has almost double the metadata operations, which increases FUSE overhead.
+Second, I/O sizes are smaller in mail-server which improves the underlying Ext4 SSD performance and therefore shifts the bottleneck to FUSE.
+Web Server.
+Figure 8 shows different types of requests generated during the web-server workload.
+This workload is highly read-intensive as expected from a Web-server that services static Web-pages.
+The performance degradation caused by StackfsBase falls into the Red class in both HDD and SSD.
+The major bottleneck was due to the FUSE daemon being single-threaded, while the workload itself contained 100 user threads.
+Performance improved with StackfsOpt significantly on both HDD and SSD, mainly thanks to using multiple threads.
+In fact, StackfsOpt performance on HDD is even 6% higher than of native Ext4.
+We believe this minor improvement is caused by the Linux VFS treating Stackfs and Ext4 as two independent file systems and allowing them together to cache more data compared to when Ext4 is used alone, without Stackfs.
+This does not help SSD setup as much due to the high speed of SSD.I N I T L O O K U P G E T A T T R C R E A T E O P E N R E A D G E T X A T T R W R I T E F L U S H R E L E A S E U N L I N K F O R G E T 1 1.4M 364K 250KI N I T L O O K U P G E T A T T R C R E A T E O P E N R E A D G E T X A T T R W R I T E F S Y N C F L U S H R E L E A S E U N L I N K F O R G E Many researchers used FUSE to implement file systems [3,9,15,40] but little attention was given to understanding FUSE's underlying design and performance.
+To the best of our knowledge, only two papers studied some aspects of FUSE.
+First, Rajgarhia and Gehani evaluated FUSE performance with Java bindings [27].
+Compared to this work, they focused on evaluating Java library wrappers, used only three workloads, and ran experiments with FUSE v2.8.0-pre1 (released in 2008).
+The version they used did not support zero-copying via splice, writeback caching, and other important features.
+The authors also presented only limited information about FUSE design at the time.
+Second, in a position paper, Tarasov et al. characterized FUSE performance for a variety of workloads but did not analyze the results [36].
+Furthermore, they evaluated only default FUSE configuration and discussed only FUSE's high-level architecture.
+In this paper we evaluated and analyzed several FUSE configurations in detail, and described FUSE's low-level architecture.Several researchers designed and implemented useful extensions to FUSE.
+Re-FUSE automatically restarts FUSE file systems that crash [33].
+To improve FUSE performance, Narayan et al. proposed to marry in-kernel stackable file systems [44] with FUSE [23].
+Shun et al. modified FUSE's kernel module to allow applications to access storage devices directly [17].
+These improvements were in research prototypes and were never included in the mainline.
+User-space file systems are popular for prototyping new ideas and developing complex production file systems that are difficult to maintain in kernel.
+Although many researchers and companies rely on user-space file systems, little attention was given to understanding the performance implications of moving file systems to user space.
+In this paper we first presented the detailed design of FUSE, the most popular user-space file system framework.
+We then conducted a broad performance characterization of FUSE and we present an in-depth analysis of FUSE performance patterns.
+We found that for many workloads, an optimized FUSE can perform within 5% of native Ext4.
+However, some workloads are unfriendly to FUSE and even if optimized, FUSE degrades their performance by up to 83%.
+Also, in terms of the CPU utilization, the relative increase seen is 31%.
+All of our code and Filebench workloads files are available from http:// filesystems.org/ fuse/ .
+Future work.
+There is a large room for improvement in FUSE performance.
+We plan to add support for compound FUSE requests and investigate the possibility of shared memory between kernel and user spaces for faster communications.
+We thank the anonymous FAST reviewers and our shepherd Tudor Marian for their valuable comments.
+This work was made possible in part thanks to Dell-EMC, NetApp, and IBM support; NSF awards CNS-1251137, CNS-1302246, CNS-1305360, and CNS-1622832; and ONR award 12055763.

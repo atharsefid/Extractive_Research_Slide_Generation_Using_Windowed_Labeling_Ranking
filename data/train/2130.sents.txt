@@ -1,0 +1,360 @@
+Direct assignment of I/O devices (Direct I/O) is the best per-formant I/O virtualization method.
+However, it requires the hypervisor to statically pin the entire guest memory, thereby hindering the efficiency of memory management.
+This problem can be fixed by presenting a virtual IOMMU (vIOMMU).
+Emulation of its DMA remapping capability carries sufficient information about guest DMA buffers, allowing the hypervisor to do fine-grained pinning of guest memory.
+However, established vIOMMUs are not widely used by commodity guests due to the emulation cost, thus cannot reliably eliminate static pinning in direct I/O.
+We propose and implement coIOMMU, a new vIOMMU architecture for efficient memory management with a cooperative DMA buffer tracking mechanism.
+The new mechanism provides a dedicated interface for hypervisor and guest to exchange DMA buffer information over a shared DMA tracking table (DTT), orthogonal to the costly DMA remapping interface.
+We also explore two techniques: smart pinning and lazy unpinning, to minimize the impact on the performance of direct I/O.
+Our evaluation results show that coIOMMU dramatically improves the efficiency of memory management in wide direct I/O usages with negligible cost.
+Moreover, the desired semantics of DMA remapping can be sustained when cooperative tracking is enabled alongside.
+Overall, we believe that coIOMMU can serve as a reliable solution for efficient memory management in direct I/O.
+Direct I/O [1,21,29,31,37,39,48,49,50] is the best performant I/O virtualization method and a cornerstone capability in data centers and clouds.
+It allows the guest to directly interact with I/O devices without the intervention from software intermediary.
+An I/O memory management unit (IOMMU) [3,14,16] helps prevent Direct Memory Access (DMA) attacks in direct I/O by providing the capability of DMA remapping.
+Each assigned device is associated with an IOMMU page table (IOPT), configured by the hypervisor in a way that only the memory of the guest that owns the device is mapped.
+The IOMMU walks the IOPTs to validate and translate DMA requests, achieving inter-guest protection among directly assigned devices.Most devices do not tolerate DMA faults, implying that guest buffers must be pinned in host memory and mapped in the IOPT before they are accessed by DMAs.
+However, the hypervisor does not know which pages are mapped by the guest when it is eliminated from the direct I/O path.
+Consequently, it has to pin the entire guest memory upfront, a.k.a static pinning [7,44].
+This heavily hinders the efficiency of memory management and worsens memory utilization, as pinned pages cannot be reclaimed for other purposes.Presenting a virtual IOMMU (vIOMMU) [8,23,29,52,60] to the guest allows fine-grained pinning of guest memory for efficient memory management, although its primary purpose is to help the guest protect itself against buggy drivers.
+The hypervisor emulates the DMA remapping interface by: 1) walking the virtual IOPT (vIOPT) to identify the affected buffers; 2) pinning and unpinning the buffers in the host memory; and 3) mapping and unmapping them in the physical IOMMU to enforce protection as desired by the guest.
+Naturally, the emulation leads to a fine-grained pinning scheme, if the guest always uses the vIOMMU to remap its DMA buffers.Unfortunately, established vIOMMUs are not applicable as a reliable solution for fine-grained pinning.
+Their virtual DMA remapping capabilities are disabled by most guests [8,24,30,38,51] in typical usages such as public cloud, because significant emulation cost may be incurred due to frequent mapping operations in the guest.
+Such cost could be alleviated through side-core emulation [8] or para-virtualized extension [23,52].
+However, the side-core emulation requires an additional CPU core to perform the emulation; and can only achieve optimal performance with deferred IOTLB invalidation, leading to compromised security.
+Para-virtualized extension reduces the virtualization overhead with optimized interfaces, but it still involves large number of VM-exits at the time of guest DMA mappings/unmappings, hence limiting the performance.
+Therefore, they did not change the fact that established vIOMMUs are used only in limited circumstances, e.g. when intra-guest protection is valued over the overhead of DMA remapping.We argue that mixing the requirements of protection and pinning, through the same costly DMA remapping interface, is needlessly constraining.
+Protection is a guest requirement, while pinning is for host memory management.
+The two do not always match, thus favoring one may easily break the other.
+Instead, we aim to provide a reliable solution for finegrained pinning by decoupling it from protection.We propose and implement a new vIOMMU architecture called coIOMMU, which helps the hypervisor achieve efficient memory management in direct I/O.
+It introduces a dedicated mechanism for cooperative DMA buffer tracking, orthogonal to the costly DMA remapping interface.
+coIOMMU allows the hypervisor and guest to communicate over a DMA tracking table (DTT) located in a shared memory region.
+The guest records the mapping status of its DMA buffers in the DTT and the hypervisor walks the DTT to identify the corresponding pinning requirement.
+coIOMMU further minimizes the number of notifications from the guest, with two optimizations: (1) smart pinning, which heuristically pins frequently used pages and timely shares its pinning status with the guest, to enable precise notification in guest-mapping operations; and (2) lazy unpinning, which asynchronously unpins guest pages to eliminate notifications in guest-unmapping operations.
+On the other hand, the new mechanism does not affect the desired semantics of DMA remapping.
+It can be enabled with or without DMA remapping, as a reliable and standard interface to achieve fine-grained pinning in direct I/O.
+We implement coIOMMU by extending KVM/QEMU vIOMMU and Linux guest.
+The concept and implementation can be easily ported to other hypervisors, vIOMMUs and guest OSes.
+Overall, the main contributions of this paper are:• Observing that established vIOMMUs cannot reliably fix the problem of static pinning in direct I/O, due to the costly DMA remapping interface.
+• Proposing and implementing coIOMMU, the first vIOMMU that introduces a dedicated DMA buffer tracking mechanism for fine-grained pinning.
+• Introducing smart pinning and lazy unpinning to dramatically reduce the tracking overhead in fine-grained pinning.
+• Conducting comprehensive evaluations under different Linux protection policies, with benchmarks in direct networking, storage, and GPU.
+• Demonstrating that coIOMMU not only dramatically improves the efficiency of memory management in wide direct I/O usages with negligible cost, but also sustains the desired security as required in specific protection policies.The rest of the paper is organized as follows.
+The background and motivation are first provided in section 2.
+We present the design of coIOMMU in section 3 and its implementation in section 4.
+Finally, the evaluation results are shown and discussed in section 5, with future work and conclusion drawn in section 6.
+Direct I/O is the best performant I/O virtualization method by enabling direct communication between the guest and the I/O devices.
+Removal of the software intermediary not only provides much better performance than other I/O virtualization approaches, but also allows faster time-to-market for virtualizing new I/O acceleration capabilities.
+Direct I/O proliferates via device-side virtualization.
+Single-Root I/O Virtualization (SR-IOV) [1,13] allows the device to multiplex its resource into virtual functions, each independently assignable to a guest.
+Cloud service providers even offload para-virtualized backend drivers into directly assigned devices [11,12].
+With these hardware trends, direct I/O has gained mainstream support in commodity hypervisors and is becoming a cornerstone capability in data centers and clouds.IOMMUs [3,14,16] are introduced by hardware vendors to prevent assigned devices from touching arbitrary memory locations.
+Use of the IOMMU leads to the static pinning problem due to two factors: (1) most I/O devices do not tolerate DMA faults, and (2) the hypervisor does not know how guest memory is used for DMA.
+The hypervisor has to pin the entire guest memory upfront, assuming that every guest page might be a DMA page.
+This heavily hinders the efficiency of memory management and worsens memory utilization, as pinned pages cannot be reclaimed for other purposes.
+Previous studies generally tackle this problem in two directions: making the device support DMA page faults or exposing the DMA buffer information to the hypervisor through software approaches.DMA page faults allow all kinds of memory optimizations that CPU page faults provide.
+The PCI-SIG standardizes the support of DMA page faults with Address Translation Service (ATS) and Page Request Service (PRS) [2].
+It was originally introduced to simplify the programming model on GPUs [27,41,42] and now also starts to find its way into NICs [6] and FPGA [9].
+However, the latency of handling DMA page faults is 3x-80x higher than that of handling CPU faults [6,40].
+Such long latency, up to hundreds of microseconds, demands a larger on-device buffer to hold in-flight requests and incurs higher device cost.
+Handling such long latency in all critical paths further complicates the device.
+Therefore, most commodity devices do not support DMA page faults, or partially support it only for selective workloads.
+With time, it may become a preferable way for finegrained pinning, but not anytime soon.Alternatively, researchers also look at software approaches to expose enlightened guest DMA information to the hypervisor.
+Knowing when a guest page is mapped or unmapped allows the hypervisor to pin or unpin it dynamically.
+Willmann et al. [44] evaluates several mapping strategies, revealing that a big performance penalty is incurred when blindly doing hypercalls to notify the hypervisor of every guest mapping/unmapping operation.
+Yassour et al. [7] dramatically reduces such notifications with a guest-side pin-down cache.
+However, it puts a complex eviction policy in the guest and provides no intra-guest protection.Presenting a vIOMMU [23,29,60] also provides sufficient information for fine-grained pinning, as a result of emulating its DMA remapping capability for intra-guest protection.
+However, such emulation may incur significant cost, especially when frequent mapping operations are requested by the guest.
+To trade off performance and protection, modern OSes typically implement different policies about DMA remapping.
+For example, Linux [8,24,30,38,51] implements strict, lazy and passthrough policies.
+Although DMA remapping is used in strict and lazy policies, the passthrough policy simply disables it to gain best performance.
+Obviously, the guest cannot provide any DMA buffer information to the hypervisor when the passthrough policy is selected.
+Unfortunately, major guest Linux distributions choose passthrough as default and even allow different policies across devices.Recent studies focus on reducing the cost of emulating DMA remapping in vIOMMU.
+Tang et al. [52] reduces the remapping overhead by reusing old mappings and delaying their removal, however, at the cost of compromised security.
+Side-core emulation [8] achieves 100% of 10Gbps line rate with a fully emulated vIOMMU, but with relaxed protection and increased total cost.
+The overhead of DMA remapping is also tackled on bare metal [24,30,38].
+While these works generally apply to the guest OS as well, most of them have not been adopted by commodity OSes due to its intrusiveness.
+In a nutshell, the cost of DMA remapping is still notable in the guest today, leaving the capability disabled or even not exposed in most cloud and data center usages.
+We prefer the vIOMMU approach for two reasons: 1) it supports both intra-guest protection and fine-grained pinning; and 2) DMA page faults are not widely supported by commodity devices.
+However, we want to go a different direction from previous studies -to enable fine-grained pinning without being encumbered by the intrinsic cost of DMA remapping.We argue that mixing the requirements of protection and pinning, through the same costly DMA remapping interface, is needlessly constraining.
+Protection is a guest requirement and relies on the DMA remapping capability, while pinning is for host memory management and needs the capability of tracking guest DMA buffers.
+The two do not always match, thus favoring one may just break the other, if both are enabled through the same interface.
+For example, the hypervisor either must fall back to static pinning by assuming that most guests disable protection, or, adopt fine-grained pinning by forcing all guests to enable protection and bear with added cost.What about inventing a separate DMA buffer tracking mechanism to the vIOMMU, without relying on any semantics of DMA remapping?
+Separating DMA tracking from DMA remapping allows us to tackle the pinning and protection problems in parallel.
+If the new tracking mechanism incurs negligible cost, we can expect most guests to always enable it and reliably provide necessary information for fine-grained pinning.
+If feasible, such an approach would make the vIOMMU as the portal of efficient memory management in future data centers and clouds.
+We propose coIOMMU, a new vIOMMU architecture that helps the hypervisor achieve efficient memory management in direct I/O.
+coIOMMU provides a dedicated DMA buffer tracking mechanism that adopts a shared memory interface for efficient communication between host and guest.
+The guest records the mapping status of its DMA buffers through a shared DMA tracking table (DTT), for the hypervisor to decide its pinning strategy.
+coIOMMU also introduces two optimizations: smart pinning and lazy unpinning, to dramatically reduce the performance impact when achieving finegrained pinning.
+We want the new DMA buffer tracking mechanism to meet these goals:Orthogonal to DMA Remapping -Our solution should allow DMA buffer tracking and DMA remapping independently configured by the guest.
+The new tracking mechanism, once enabled, should consistently supply sufficient information for fine-grained pinning, regardless of how DMA remapping is configured to protect guest.
+Enabling of DMA buffer tracking should not affect the desired protection semantics of DMA remapping.Low Cost -DMA buffer tracking should incur negligible cost.
+Otherwise, it faces the same challenge as in DMA remapping: if significant cost is observed, why would one enable it by default?
+We focus on the efficiency of DMA buffer tracking itself and have no intention to further optimize DMA remapping in this work.
+The original performance expectation under each guest protection policy is set as the baseline for comparing the cost of DMA buffer tracking in our evaluations.Non-intrusiveness -We want our solution to minimize the changes in the guest software stack, as a primary factor to gain mainstream support in commodity OSes.
+Commodity OSes provide a generic DMA API layer [25,43] to route DMA mapping requests from device drivers to underlying DMA driver.
+DMA buffers can be tracked either in the DMA API layer or specific DMA driver.
+We did not choose DMA API because any change in such common framework usually takes a long time to be adopted by commodity OSes.Wide Applicability -We prefer a solution that works with all kinds of I/O devices rather than requiring additional changes in hardware or device drivers.
+We also expect such a solution to make no assumption on any vendor specific characteristics, so it can be easily ported to different vIOMMUs, either emulated or para-virtualized.
+Extensibility -The solution should be extensible to help address other limitations in memory management.
+For example, another challenge in direct I/O is about lively migrating the guest with assigned devices, which requires the ability of tracking the pages that are dirtied by DMAs [20,26,28,35].
+We expect our solution can play as a portal of tracking all kinds of DMA buffer status for efficient memory management.
+The coIOMMU architecture is illustrated in Figure 1, composed of coIOMMU backend in hypervisor and coIOMMU driver inside the guest.
+The coIOMMU backend includes three main components: (1) DMA remapping engine (remapEngine), the same functionality for intra-guest protection as in established vIOMMUs, over a set of per-device vIOMMU page tables (vIOPTs); (2) DMA tracking engine (trackEngine), a new function dedicated for tracking guest DMA buffers over a global DMA tracking table (DTT); and (3) Page-pinning manager (pManager), which uses the information gathered by trackEngine to intelligently manage the pinning requirements of guest memory.
+The remapEngine and trackEngine are independently enumerated and managed by the coIOMMU driver, while pManager is hidden and activated automatically when trackEngine is enabled.In our prototype, we build coIOMMU by extending an existing vIOMMU, which emulates the Intel VT-d hardware [3].
+This allows us to focus on the new trackEngine and pManager, while inheriting the established DMA remapping logic as remapEngine.
+However, we make no assumption on the specific hardware or vIOMMU type.
+The design of trackEngine and pManager can be easily ported to any emulated or para-virtualized vIOMMU.The trackEngine holds the base address of the DTT, which is allocated and registered by the coIOMMU driver.
+The format of the DTT is a hierarchical page table, containing the mapping information required by fine-grained pinning.
+trackEngine also includes a doorbell register to notify the hypervisor if necessary.
+Within the coIOMMU backend, trackEngine provides interfaces for pManager to access the DTT and also notifies pManager when the doorbell is rung.
+With this design, trackEngine acts as a standard interface solely for conveying the DMA information, while pManager actually uses the information to achieve fine-grained pinning.
+The separation between these two components allows coIOMMU to be easily extended for other purposes, e.g. by introducing another agent to track dirty pages, alongside pManager, while reusing the same trackEngine interface.The coIOMMU driver intercepts the DMA API operations in the guest and updates the DTT accordingly.
+Modern OSes all implement a generic DMA API layer [25,43], connecting device drivers to the underlying DMA driver to prepare their DMA buffers.
+The coIOMMU driver registers itself as a DMA driver to capture the latest mapping status of guest DMA buffers.
+This driver also enforces the desired protection semantics, as other vIOMMU drivers normally do today.
+In this way, DMA tracking is enabled without any change to the DMA API layer or specific device drivers of the guest.The pManager contains hypervisor-specific policies for finegrained pinning.
+A specific implementation may even include multiple policies and let the hypervisor dynamically choose a policy at runtime.
+We demonstrate two optimizations in §3.4: smart pinning and lazy unpinning, to minimize the notification overhead.
+When required, pManager talks to the memory manager for pinning or unpinning a set of guest pages and request the IOMMU driver for mapping or unmapping them in the physical IOPT.
+When both remapEngine and pManager are enabled, their pinning decisions are ORed together to favor the stricter requirement.
+Once a guest page is unpinned and unmapped, it can be reclaimed under whatever policy applied by the memory manager.
+Table (DTT) The DTT records the mapping status of guest DMA buffers.
+It is shared by all assigned devices because the hypervisor only wants to know the DMA buffers of the entire guest.
+It is not necessary to track DMA buffers for virtual devices, assuming their DMAs are emulated by and already known to the hypervisor.
+The DTT is allocated by the guest, starting as empty and then filled dynamically according to intercepted DMA operations.
+We choose to track two categories of guest pages in the DTT: 1) the pages that are currently mapped by the guest and 2) the pages that have been unmapped but still Pin/ unpin Page-Pinning Manager pinned by the hypervisor.
+The latter category is necessary for lazy unpinning introduced in the next section.One may argue why inventing a new table instead of reusing the vIOPTs, when the latter also carry the information of guest DMA buffers.
+We considered this approach but gave up for several reasons.
+First, the vIOPT is designed for intraguest protection which disallows pinning a page after it is unmapped thus also negates lazy unpinning.
+Second, the table is indexed by guest I/O Virtual Address (IOVA) for the remapping purpose.
+The hypervisor has to walk every vIOPT to find out whether a guest page is mapped, which is too costly.
+Last but not the least, the format of vIOPT is typically vendor-specific, so extending it may not lead to good portability.The DTT is a 4-level page table in 4KB pages, as shown in Figure 2.
+The 4KB leaf page consists of 512 DTT PTEs (DTEs) and each 8-bytes DTE is further split into 8 tracking units (TU).
+Each TU corresponds to one 4KB guest page.
+In total, the DTT can support up to 51-bits (9+9+9+9+3+12=51) guest physical address width, big enough for prevalent virtualization usages.
+Such design leaves 8-bits available in each TU.
+coIOMMU currently uses 3 bits for fine-grained pinning, with the other 5-bits reserved for future extension:• 'M (mapped)', indicating a page currently mapped by guest for DMA.
+It is set and cleared by the guest before and after the corresponding DMA and is read-only to the hypervisor.
+This bit conveys the primary information used by fine-grained pinning.
+• 'P (pinned)', marking a page currently pinned by the hypervisor.
+It is updated by the hypervisor to reflect the pinning status and is read-only to the guest, necessary for smart pinning.
+• 'A (accessed)', telling whether a page has ever been used for DMA.
+The guest sets this bit alongside the setting of M-bit ('mapped' bit).
+Then it stays sticky until the hypervisor clears it in lazy unpinning.An entry with both M and P bits cleared marks the page as invalid.
+If every entry of a DTT page is invalid, the guest may choose to free this page to save space.
+Two techniques are introduced in coIOMMU: smart pinning and lazy unpinning, to minimize the notification overhead of fine-grained pinning.
+We focus on the scenario where the DMA remapping capability of coIOMMU is disabled by the guest.
+In this case, there is no intra-guest protection requirement thus the hypervisor can pin more pages than what guest actually maps.
+coIOMMU manages the pinning of guest pages in three ways:(1) instantly pinning: the guest instantly notifies the hypervisor to pin pages when they are being mapped, for correctness; (2) precise notification: the guest notifies the hypervisor if and only if the to-be-mapped pages are not pinned, to minimize the notification overhead; and (3) speculatively pinning: pManager heuristically pins the frequently used pages for performance.First, pinning must be instantly done before any mapped page is used for DMA, because most devices do not tolerate DMA faults, as aforementioned.
+In such circumstance, the hypervisor must be notified by the guest to complete the pinning action in a timely manner, if the page has not yet been pinned.Second, coIOMMU exposes the pinning status to the guest through the P-bit ('pinned' bit) in the DTT, for precise notification.
+If the P-bit is cleared by the hypervisor, the guest must notify the hypervisor instantly when mapping a page.
+Otherwise, no notification is needed at all.
+This optimization allows the guest to skip most notifications in its mapping operations.Last, pManager speculatively selects and pins frequently used pages by leveraging the guest DMA locality, which has been identified in both previous studies [7,44,51] and our evaluation.
+The DTT includes an A-bit ('accessed' bit) to mark a page ever used for DMA.
+The guest sets the A-bit when mapping a page and leaves it set until the hypervisor clears it.
+pManager determines the ages of unmapped pages by periodically scanning the A-bits (and clears it after a scan).
+Young pages (with A-bit set) are candidates of frequently used pages and might be accessed soon again.
+So pManager heuristically pins them to avoid the overhead of another pinning notification in the near future.Our evaluation shows that precise notification and speculative pinning can dramatically reduce the notification overhead in instant pinning by up to 99.9992% (from 1.5M to 11 notifications, per second), when running memcached with a 40Gbps NIC connection.
+One notification takes ~2000-4000 cycles in our evaluation, so 1.5M notifications per second may eat up 1-2 CPU cores without such optimization.
+6 3 5 1 5 0 4 2 4 1 3 3 3 2 2 4 2 3 1 5 1 4 1 2 1 1 0 Reserved <<3 + DTT Base Pointer L4 Table <<3 + <<3 + L3 Table L2 Table <<3 + L1 Table DTE TU0 TU1 TU2 TU3 TU4 TU5 TU6 TU7 R R R R R A P M Tracking Unit (TU)M: mapped P: pinned A: accessed R: ReservedGuest Physical Address (GPA) The pManager lazily unpins guest pages to completely eliminate the notification overhead in guest unmapping operations.
+It asynchronously scans the DTT to find out the pages that are unmapped but still pinned, and then unpins them in a batch.
+In our prototype, we process lazy unpinning and speculative pinning together in the same thread.
+Unpinned pages are reclaimable by the memory manager to increase overall memory utilization.
+In the same example of memcached, lazy unpinning eliminates another 1.5M notifications per second for guest unmapping operations, which means saving another 1-2 CPU cores, with the cost of pinning additional ~1% memory (0.32MB) than the total size of mapped pages (34.68MB), in average.
+The DMA remapping engine (remapEngine) can achieve fine-grained pinning as well, as it is required to precisely map and pin DMA buffers per guest protection requirements.
+However, one cannot solely rely on DMA remapping because the guest may selectively turn it off for certain devices according to its protection strategy.
+We describe two examples as below.First, the guest may dynamically enable/disable DMA remapping for an assigned device, leaving the hypervisor to switch back and forth between static pinning and fine-grained pinning.
+For example, guest Linux typically enables DMA remapping when assigning a device to its user space and then disables remapping when returning the device back to its kernel space [45].
+The switch between static and fine-grained pinning may lead to intermittent out-of-memory errors in a budget system.
+Moreover, the hypervisor needs to unpin all the guest pages when switching away from and then re-pin them when switching back to static pinning, leading to increased overhead.Second, if the guest enables DMA remapping only for selected devices, DMA remapping cannot provide full DMA buffer information for fine-grained pinning.
+For example, most Linux distributions enable DMA remapping only for untrusted devices, based on physical characteristics of the device [61,62].
+Such flexible configuration is possible because DMA remapping is typically enabled per device.
+However, fine-grained pinning needs to know DMA buffers used by all assigned devices in the guest, even for the ones that are not protected with DMA remapping.
+In such case, the hypervisor must fall back to static pinning with reduced memory utilization.In both of these examples, DMA buffer tracking of coIOMMU allows reliably providing full DMA buffer information to enable fine-grained pinning.
+When tracking and remapping are both enabled, it is possible for the two to make different pinning decision for the same page.
+In such case, the decision from the DMA remapping interface takes precedence, because we must not break any protection semantics desired by the guest.
+We implement coIOMMU by extending the virtual Intel VTd, which is an emulated vIOMMU in QEMU [58] (the device model of KVM hypervisor [10]), and the intel-iommu driver in the guest Linux.
+In QEMU, the original DMA remapping logic of the virtual VT-d is reused as remapEngine, while trackEngine and pManager are developed from scratch.
+Guest-side changes are all contained in the intel-iommu driver and hidden behind the Linux DMA API layer.
+There is no change required in guest device drivers.
+Currently, coIOMMU adds ~700 LOC in QEMU and ~1000 LOC in guest.coIOMMU driver -coIOMMU driver extends guest inteliommu driver to manage the trackEngine when the capability is detected.
+The intel-iommu driver registers callbacks to the Linux DMA API layer for mapping and unmapping DMA pages in different forms, e.g. for single page or scatter-gathered page list, for pre-allocated pages or newly allocated pages, etc.
+We extend the driver by extracting the DMA buffer information from those callbacks and updating the corresponding tracking units (TUs) in DTT.
+The DTT is allocated in the guest memory, which is always accessible by the commodity KVM hypervisor.
+If such direct access is prohibited in some specific security related usage cases [55,56], the DTT should be allocated in a shared memory region.
+Last, the coIOMMU driver conditionally notifies the hypervisor based on the DTT status.trackEngine -We extend the virtual VT-d with several changes: (1) a capability bit for enumerating the presence of trackEngine, (2) an enabling bit for activating trackEngine, (3) a register holding the base address of the DTT, (4) a register as the doorbell interface for triggering notification to pManager, and (5) a register pointing to the base address of the notification structure.
+The notification structure is designed to allow batching requests of multiple pages into one notification, in case of those pages are mapped together.
+trackEngine also provides function calls for pManager to scan and update the DTT.pManager -The implementation of pManager can be split into two parts.
+First, it provides direct function calls for trackEngine to complete instant pinning.
+The functions are invoked synchronously in the vCPU threads when QEMU emulates the guest write to the doorbell register.
+Second, pManager also launches a thread for lazy unpinning and speculative pinning, woken up every one second.
+This thread scans the DTT to find out all the pages that are unmapped but still pinned and speculatively unpin them based on their A-bits.
+When a pinning decision is made, pManager invokes the VFIO API [45] to pin/unpin selected pages and map/unmap them in the IOMMU.Sub-Page Mappings -Multiple DMA buffers may co-locate in the same 4KB guest page, e.g. as widely observed when handling network packets.
+Sub-page mappings imply that one page might be mapped and unmapped multiple times.
+In such case, coIOMMU driver tracks the mapping count of each mapped page and clears the "M-bit" of the corresponding entry only when its count reaches zero.
+We choose to leverage the 5 reserved bits in each TU as the mapping count, holding up to 31 sub-page mappings.
+Doing so simplifies the implementation and works well in our evaluations.
+Other implementations may choose different structures for such tracking purpose.Concurrency -coIOMMU must properly handle concurrent pinning/unpinning requests between multiple vCPU threads and the unpinning thread, as shown in Figure 3.
+First, multiple vCPUs may try to map and pin the same DMA page simultaneously, e.g. in sub-page mapping scenario.
+We employ different locking mechanisms in guest and host for race avoidance.
+Within the guest kernel, spinlock is required for atomically setting the 'mapped' flag and checking the 'pinned' status of a target page.
+It is necessary as DMA mappings may happen in the guest interrupt context.
+On the other hand, a mutex is introduced in QEMU for atomically completing the actual pinning actions: 1) rechecking the 'pinned' status; 2) pinning the page; and 3) updating the 'pinned' flag.Second, race condition may happen between concurrent pinning requests (from the vCPU threads) and unpinning requests (from the unpinning thread).
+For example, it is possible seeing an unpinning operation starts before, yet completes after, an in-flight pinning request.
+Such race may lead to the pinning request completing successfully but with the target page actually unpinned.
+We introduce two mechanisms to solve this problem.
+For one, the unpinning thread needs to check the 'mapped' flag before and after clearing the 'pinned' status.
+We call this special sequence as double-detection, necessary to catch in-flight change of the mapping status in the guest side.
+For two, the unpinning thread also needs to acquire the aforementioned QEMU mutex for completing its unpinning actions.
+In particular, the second check of the 'mapped' flag must be done with the mutex acquired and before conducting the unpinning action.
+If the 'mapped' status becomes true, indicating that a pinning action is in progress for the target page, the unpinning thread should cancel the unpinning operation immediately.
+Applicability -coIOMMU applies to all kinds of directly assigned devices, without the need of ad-hoc changes in hardware or software.
+Porting our Linux implementation to a new guest OS is straightforward, as long as the OS implements a generic DMA API layer which, obviously, is already a common feature in commodity OSes today.
+On the other hand, the implementation of trackEngine and pManager is vendorneutral and self-contained.
+The separation between DMA tracking and DMA remapping allow coIOMMU implementation to be easily portable to other vIOMMUs, regardless of whether remapEngine is emulated or para-virtualized.
+Extensibility -The page table format of the DTT can be extended to address other limitations in memory management.
+For example, introducing a "D (dirty)" bit in the TU provides a generic solution for tracking dirty pages when lively migrating VMs in direct I/O.
+Similarly, using a "W (writable)" bit to indicate read-only page enables the hypervisor to implement copy-on-write features.
+Ideally, a specific implementation may extend the DTT to include the same set of permission or status bits as available in a CPU page table.Currently the DTT tracks DMA buffers in 4KB granularity.
+It is sufficient for most direct I/O usages, as DMA buffers are typically allocated in scattered 4KB pages.
+When large DMA buffer is used, we rely on pManager to merge batched pinning requests on continuous DMA pages into 2MB-based requests.
+We observed such optimization leads to ~4.5% FPS improvement in direct GPU benchmark, as illustrated in 5.1.
+Alternatively, one may also directly extend the DTT format to support 2MB-granular tracking entries.Kernel Bypassing -coIOMMU also applies to various kernel bypassing techniques [32,33,45], which allow applications to directly manage DMA buffers in user space.
+Applications are untrusted, so they must first register a trunk of memory to the kernel and then manage within that trunk.
+The registration goes through proper kernel interfaces, e.g. AF_XDP [33] or VFIO [45] in Linux, which finally call into the coIOMMU driver for actual mappings and unmappings thereby are still tracked in the DTT.
+Kernel bypassing may increase the memory footprint because applications usually register a oneoff big buffer pool to avoid calling into the kernel frequently.We leave optimizing such workloads as future work.DMA Page Faults -For devices which do support DMA page faults, on-demand memory allocation/reclaim can happen at any time thus one could implement fine-grained pinning without using coIOMMU.
+However, coIOMMU may still provide two benefits in such circumstance.
+First, the overhead of handling DMA page faults might be non-negligible in hot data paths.
+coIOMMU allows the guest to reduce the number of faults by proactively requesting pre-pinning of hot pages, based on the knowledge that is easily extracted from DTT, yet invisible or difficult to acquire in legacy host.
+Second, some devices may allow DMA page faults only in selective data paths.
+Hypervisor could enable coIOMMU alongside the fault-based pinning scheme, to track DMA pages which are touched in non-faultable data paths in such devices.Guest Cooperation -coIOMMU is a para-virtualized approach thus requires guest cooperation.
+We plan to submit our work to Linux and QEMU community, so coIOMMU could be enabled by default in most Linux distributions in the future.
+However, it is possible that a selfish guest may deliberately report fake DMA pages or simply disable coIOMMU driver to get more pages pinned than a cooperative guest.
+When required, one may choose to build a quota mechanism alongside the new tracking interface of coIOMMU.
+For example, the memory ballooning mechanism [57] can be extended to convey the quota information of both total memory and DMA memory, based on the service level agreement of the guest.
+Afterward, pManager could reject new pinning requests from any guest after its quota is exceeded.
+Our evaluation aims to answer several questions.
+How does the overhead imposed by coIOMMU compare to that of established vIOMMUs?
+How many pages are pinned in various direct I/O usages when using coIOMMU to enable finegrained pinning?
+Does coIOMMU sustain the desired performance and security under different intra-guest protection policies?
+We answer these questions by planning our evaluation to focus on four aspects: footprint, overhead, security and applicability.Evaluated Modes -We evaluate six modes as shown in Table 1.
+The guest intel-iommu driver supports three protection policies: 1) passthrough, the default policy that disables DMA remapping for performance; 2) strict, using DMA remapping to gain full protection; and 3) lazy, trading off some security for performance when using DMA remapping (e.g. by deferring and batching IOTLB invalidations).
+We study the three policies for coIOMMU and a state-of-the-art vIOMMU, Experimental Setup -Our setup consists of three machines, all running Ubuntu 16.04 with kernel 5.0.0.
+The primary machine, used for networking and storage tests, is equipped with a 16-core Intel Xeon Cascade Lake CPU at 2.7GHz, one 64GB DDR4 DIMM, an Intel XL710 40Gbps NIC, and two Intel 760P series 1TB NVMe SSDs.
+The 2 nd machine acts as the network traffic generator, with another XL710 NIC connected to the primary machine back-to-back.
+It includes dual Intel Xeon Gold 6140 CPUs, each with 18 cores at 2.30GHz and 64GB DDR4 memory.
+The last machine is used for GPU evaluation, equipped with Intel Core i7-7567U CPU with four cores at 3.50GHz, 32GB DDR4 memory, a 256GB Intel 520 series SSD, and an Intel® Iris® Plus graphics 650 GPU.The VM of the first machine is based on RHEL7.2 with kernel 5.1.0-rc3+, configured with 16 vCPUs, 32GB memory, and a directly assigned device -either a XL710 NIC or a 760P SSD, according to whether direct-networking or directstorage is under evaluation.
+The two assigned devices are enabled independently, to avoid mutual interference from section 5.1 to section 5.5.
+In section 5.6, we evaluated their performance running combined workloads with both devices assigned.
+The VM for direct GPU includes Ubuntu 18.04 with kernel 5.1.0-rc3+, 4 vCPUs, 4GB memory, and a directly assigned Intel® Iris® Plus graphics 650 GPU.
+The vCPUs of both VMs are 1:1 pinned to the physical cores for stable results.Benchmarks -We choose both micro-benchmarks and macrobenchmarks for evaluating the six modes in direct networking, direct storage and direct GPU:• Netperf [63] is a standard micro-benchmark to measure networking throughput.
+We perform Netperf stream receive (RX) and transmit (TX) tests, using 64KB message size with 16 Netperf client/server instances (one per core) in the guest.
+Aggregated throughput is reported.
+• Memcached [65] is a popular in-memory key-value store, usually benchmarked using memaslap [70].
+We use the default memaslap configuration with 64-byte keys, 1KB values, and 90%/10% GET/SET operations.In the VM, we launch 16 memcached instances driven by 16 memaslap threads each issuing 8 concurrent requests.
+• fio [66] is a standard micro-benchmark to measure disk performance for wide range of storage types.
+We configure 16 fio threads, each performing asynchronous direct random reads from the assigned SSD, in 512-byte blocks and 128 in-flight requests.
+• OpenArena [67] is a 3D first-person shooter game, used to benchmark direct GPU.
+The throughput is reported in frame-per-second (fps).
+In addition, we also selectively run sysbench [68] as a memory benchmark and DPDK [32] for user-space networking stack, for specific evaluation purposes.
+We record the performance of aforementioned benchmarks in each evaluation mode, as shown in Figure 4.
+CPU utilization is aggregated over all cores, i.e. one core at 100% CPU would be reported as 100%/4=25% CPU utilization with 4 cores (for OpenArena) or 100%/16=6.25% CPU utilization with 16 cores (for all other benchmarks).
+In addition, we also capture the per-second number of completed DMA operations and associated VM-exits when running those benchmarks, in Table 2.
+All benchmarks run 30 seconds, except OpenArena, which must run to end in around 42 seconds.
+Next, we compare coIOMMU to virtual VT-d under the three Linux protection policies, respectively.Passthrough -All networking benchmarks (left four in Figure 4) exhibit consistent results under the passthrough policy: coIOMMU (PT-N) retains the performance comparable to that of the virtual VT-d (PT-O), with less than 3% throughput degradation and negligible variation in CPU utilization.
+Such low cost is further explained in Table 2 -although hundreds of thousands of DMA operations are tracked per second, the majority of them do not trigger any VM-exit to notify the hypervisor, due to the optimization of smart pinning and lazy unpinning.
+For example, the lowest VM-exit number is observed in memcached, with only 11 VM-exits incurred by ~3M DMA operations.The overhead of coIOMMU is unrecognizable in FIO but incurs 4.5% FPS drop in OpenArena.
+We found that OpenArena maps a big buffer (~240MB) in a batch at its launch time, with many pages adjacent to each other.
+In such case, pinning the buffer in 2MB size is more efficient than pinning in 4KB size, due to increased IOTLB efficiency.
+Unfortunately, 2MB pinning is not supported in our initial coIOMMU implementation, while it is the preferred option when KVM statically pins the entire guest memory in PT-O.
+After coIOMMU was extended to also conduct 2MB pinning for OpenArena, it then reaches the same performance as the virtual VT-d (not shown in the figure).
+We do not enable huge page pinning in other benchmarks, because they are observed with frequent mapping operations on many scattered 4KB pages.
+Blindly doing huge page pinning simply adds more cost and footprint in those circumstances.Strict and Lazy -We did not observe recognizable difference between coIOMMU (ST-N and LA-N) and virtual VT-d (ST- O and LA-O) in all benchmarks, regarding to both throughput and CPU utilization.
+There are much fewer DMA operations completed in the strict and lazy policy than that in the passthrough policy, due to the emulation cost of DMA remapping.
+As shown in Table 2, the reduction is between 2.46x (in Netperf RX) to 29.8x (in memcached) in all evaluated benchmarks.
+The tracking overhead in coIOMMU is negligible when comparing to the overhead of DMA remapping.We also explore an interesting finding between lazy and strict in Figure 4, although not directly related to coIOMMU.
+It is a common learning that batching IOTLB invalidations generally brings better performance than strictly invalidating the IOTLB one-by-one.
+However, it is not always the case in virtualization -we observed 11% and 23% lower throughput when comparing lazy to strict in Netperf TX and Nginx.
+We find the batching interface of the virtual VT-d is the root cause.
+Its emulation requires walking the entire vIOPT to identify every valid mapping.
+If the walking cost exceeds the cycles of saved invalidations, the performance of lazy is instead worse than that of strict.
+We leave studying more efficient batching interface and policy for another research.
+We sample the number of pinned pages every 3 seconds, from the beginning of the benchmarks to 6 seconds after its completion, in Figure 5.
+The extra 6 seconds are used to evaluate the elasticity of the six modes, against transitional system business.
+One note -the 'max' mark in the Y-axis indicates the total number of guest pages, representing the case of static pinning.
+It is 8M (for 32GB memory) in most benchmarks and 1M (for 4GB memory) in OpenArena.All six modes exhibit the same pattern in all benchmarks, except PT-N.
+First, PT-O is tied to static pinning, thereby always sitting in the top 'max' location.
+Second, all four modes with DMA remapping enabled (ST-O, ST-N, LA-O, and LA-N) pin the least number of pages, because they need strictly follow the desired protection semantics.
+As such, their lines completely overlap in each diagram in Figure 5.
+The line of PT-N (coIOMMU in the passthrough policy) fluctuates in the middle due to smart pinning, which heuristically pins guest pages for balancing performance and footprint.
+So, it is the focus of our following analysis.Networking -All four networking benchmarks (left four in Figure 5) start and end with the same number of pinned pages (~8800 pages) in PT-N.
+Those always-pinned pages come from Intel i40e NIC driver, which pre-maps 512 pages per vCPU as the receive buffer pool when the NIC is enabled.
+The number sums up to 8192 pages with 16 vCPUs in our configuration.The largest footprint is observed in Netperf stream TX, with up to 44530 pinned pages (174MB).
+It is ~4.4x of the pages that are actually mapped for DMA at that time.
+The additionally pinned 34158 pages reflect the DMA temporal locality, occupying only 0.4% of the total 32GB guest memory.
+coIOMMU recognizes such locality thus sustains the performance of static pinning when keeping a small memory footprint.
+Netperf stream RX pins fewer pages (up to ~18000) than TX, due to better DMA temporal locality -Intel i40e NIC driver prefers to use the pre-mapped 8192 pages for incoming packets.
+On the other hand, Nginx and Memcached are less throughput sensitive than Netperf TX/RX, yielding a transfer rate of 2.3Gbps and 1.34 Gbps respectively.
+Accordingly, there are fewer pages used for DMA in the two benchmarks, leading to smaller footprint in coIOMMU.Storage -We configure fio to perform asynchronous direct random reads from the assigned SSD, to avoid page cache and readahead optimization in guest Linux.
+16 fio threads are launched to read the disk with a 512-byte block size and 128 in-flight requests per I/O queue, summing up to 256 pages for potential DMAs.
+The guest storage driver pre-maps 302 pages at boot time.
+Therefore, up to 558 pages may be mapped for DMA simultaneously, at any time.
+Obviously, coIOMMU precisely captures such temporal locality and constantly pins 558 pages in our test.GPU -There is no recognizable difference between the line of PT-N and the bottom four lines, in OpenArena.
+The reason is simple, as explained in §5.1, that OpenArena maps most of its DMA pages (~240MB) one-off at launch time and then unmaps them only at exit.
+In such circumstance, smart pinning and lazy unpinning have no effect at all.
+Therefore, all five fine-grained pinning modes pin the similar number of guest pages, with only static pinning staying in the top.
+Overcommitment allows the aggregated size of all VMs to exceed the physical memory, thus improving memory utilization.
+We explore this configuration in both coIOMMU (PT-N) and the virtual VT-d (PT-O), to demonstrate the value of fine-grained pinning.We create two VMs in the test machine with 64GB physical memory.
+VM1 has no assigned device and is configured with 32GB memory.
+It runs sysbench to randomly access a 16GB memory region.
+On the other hand, VM2 is assigned with an Intel i40e NIC and is configured with 48GB memory.
+It runs Netperf to send packets through the assigned NIC.
+The total memory size of the two VMs (80GB) exceeds the physical memory limitation.We compare the performance of running them together to that of running each alone, in Figure 6.
+With the virtual VT-d, Netperf sustains the single-VM performance while sysbench suffers 25% performance drop.
+The drop is caused by frequent page swaps due to insufficient host memory.
+There is only 8.8GB left after statically pinning 48GB memory for VM2.
+The situation gets worse with random errors reported in VM1, when increasing the memory intensity of sysbench.
+Conversely, both VMs achieve their desired performance with coIOMMU, with 49GB free memory available even when two benchmarks are both running.
+The guest kernel may directly assign a device to its user space for improved performance.
+However, kernel bypassing imposes the risk of DMA attacks from the user space.
+In such case, the guest kernel typically turns on DMA remapping of vIOMMU when the device is being assigned to the user space and then turns off remapping after the device is assigned backed to the kernel.
+In such circumstance, coIOMMU can help the hypervisor maintain fine-grained pinning reliably, while state-of-the-art vIOMMUs suffer from increased overhead by switching back and forth between static pinning and fine-grained pinning.
+We demonstrate such an example using DPDK pktgen, which offloads TCP packet processing from the guest user space to the assigned NIC.
+We run DPDK with coIOMMU and with the virtual VT-d respectively and show the comparison in Figure 7.
+coIOMMU dramatically reduces the latency in several stages, compared with the virtual VT-d: (1) 18x reduction when the VM is created (407ms vs. 7554ms); (2) 91x reduction when the guest kernel assigns the NIC to user space DPDK (2ms vs. 183ms); and (3) 407x reduction when the NIC is assigned back to the guest kernel (2ms vs. 815ms).
+The cost of the emulated VT-d is mostly caused by pinning or unpinning the entire guest memory when switching to or away from static pinning.
+The VM creation phase suffers most because every guest page needs to be allocated and cleared in static pinning.In the meantime, coIOMMU pins no more than 186K pages, while the virtual VT-d pins many more pages varying between 186K and 8M.
+Good temporal locality on DMA buffers is crucial for high performance I/O processing, both in virtualization and on bare metal.
+Commercial OSes are optimized toward this goal, as observed in our evaluation and also reported by previous studies [7,44,51].
+On the other hand, Markuze et al. [30] observes that many pages may be used to hold DMA buffers, over time, in stock Linux.
+Hence, we studied the DMA temporal locality of the networking stack in a similar configuration, by running 16 Netperf TX instances for 15 minutes, shown in Figure 8.
+We also run a Linux 'dd' command alongside Netperf, reading the raw virtual disk into /dev/zero.
+The 'dd' command constantly causes ~20K page cache misses per second, leading to ~20K new page allocated and heavily contending with the networking stack.
+The experiment is conducted in PT-N mode, i.e. under the passthrough policy.
+Our data echoes the previous finding [30] -almost the entire guest memory (~7.9M pages, 98.7% of total memory) has ever been used for sending packets, over time.
+However, the number of pinned pages almost stays flat when coIOMMU is enabled.
+The peak number is ~106K (424MB), 2.4x of that when running Netperf TX alone and just 1.3% of the total guest memory.
+The result implies that the DMA locality in a short period is still good in such stress case, allowing the hypervisor to intelligently pin the guest pages with coIOMMU.
+We run Netperf TX and fio together to check how coIOMMU performs in mixed I/O workloads.
+The tested VM is configured with 16 vCPUs and 32GB memory as previous tests.
+It is directly assigned two devices: a XL710 NIC and a 760P SSD.
+We launch 16 netperf instances and 16 fio threads simultaneously in the VM, with each vCPU holding one netperf instance and one fio thread.
+Here we just compare PT-O vs.PT-N under the passthrough policy, as the two modes can best demonstrate the coIOMMU benefits according to the baseline data.The result is promising.
+First, there is no observable performance difference when comparing Netperf and fio to their baseline performance of running alone.
+The deviations are less than 1% and within the error bar.
+Second, the peak number of pinned pages in mixed workloads is 45200 (176.5MB), close to the sum of pinned pages of running Netperf (174MB) and fio (2.2MB) alone.
+This result proves that coIOMMU can effectively reduce the memory footprint with negligible overhead, even when running mixed direct I/O usages together.
+Established vIOMMUs cannot reliably eliminate static pinning in direct I/O, due to the emulation cost of their DMA remapping interfaces.
+We instead propose coIOMMU, a new vIOMMU architecture for efficient memory management.
+coIOMMU introduces a cooperative DMA buffer tracking mechanism for fine-grained pinning, orthogonal to the costly DMA remapping interface.
+The new mechanism uses a shared DMA tracking table (DTT) for hypervisor and guest to exchange the DMA buffer information, without incurring excessive notifications from the guest, due to smart pinning and lazy unpinning.
+We demonstrate that coIOMMU not only dramatically improves the efficiency of memory management in wide direct I/O usages with negligible cost, but also sustains the desired security as required in specific protection policies.
+Last but not the least, although we implement coIOMMU by extending an emulated vIOMMU -the virtual Intel VT-d, this design can be easily ported to other vIOMMUs.As for future work, we will focus on several areas.
+First, new IOMMU trends [53,54] begin to support two-level address translations, allowing the guest to skip certain virtual IOTLB invalidations for improved performance.
+coIOMMU should provide efficient DMA buffer tracking in two-level translation and maintain its performance benefit.
+Second, some devices (e.g. GPUs) partially support DMA page faults, e.g. only for selective pages such as those used by applications.
+We want to study a hybrid approach for fine-grained pinning, by leveraging DMA page faults for faultable pages and using coIOMMU for other non-faultable pages.
+Last, kernel bypassing usually needs to pre-map a big trunk of memory for the application to manage.
+We want to extend the coIOMMU concept from the boundary between hypervisor and guest to the boundary between kernel space and user space, to enable finer-grained memory management in such usage.

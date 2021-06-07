@@ -5,6 +5,7 @@ import cvxpy
 import numpy as np
 from pyrouge import Rouge155
 import random
+
 random.seed(2019)
 np.random.seed(2019)
 
@@ -76,18 +77,18 @@ def test_rouge(input, mode='test', tune_param=False):
         range_low = 4250
         range_high = 4500
     for i in range(range_low, range_high):
-        print('data/'+mode+'/' + str(i) + '.sents.txt')
-        story_file = glob.glob('data/'+mode+'/' + str(i) + '.sents.txt')[0]
+        print('data/' + mode + '/' + str(i) + '.sents.txt')
+        story_file = glob.glob('data/' + mode + '/' + str(i) + '.sents.txt')[0]
         sentences = [line.strip() for line in open(story_file, 'r').readlines()]
         # read slides
-        pptfile = '../slide_generator_data/data/' + str(i) + '/clean_tika.txt'
-        slides = [line.strip() for line in open(pptfile,'r').readlines()]
+        pptfile = 'slide_generator_data/data/' + str(i) + '/clean_tika.txt'
+        slides = [line.strip() for line in open(pptfile, 'r').readlines()]
         reference = ' '.join(slides)
 
         limit = int(0.2 * len(' '.join(sentences)))
 
-        label_file = glob.glob('data/'+mode+'/' + str(i) + method)[0]
-        scores = [float(label.strip()) for i, label in enumerate(open(label_file,'r').readlines()[:len(sentences)])]
+        label_file = glob.glob('data/' + mode + '/' + str(i) + method)[0]
+        scores = [float(label.strip()) for i, label in enumerate(open(label_file, 'r').readlines()[:len(sentences)])]
         lengths = [len(sent) for sent in sentences]
         if tune_param:
             # this part is to evaluate the oracle summaries built by different window sizes
@@ -115,14 +116,13 @@ def test_rouge(input, mode='test', tune_param=False):
 
 methods = [("_predicted_SummaRunnerScores.txt", "temp", True),
            ("_windowed_predicted_SummaRunnerScores.txt", "temp", True),
-            ]
-
+           ]
 
 from multiprocess import Pool
+
 pool = Pool(10)
 results = pool.map(test_rouge, methods)
 for result, method in zip(results, methods):
     print('---------', method[0], method[2], ':', result)
 pool.close()
 pool.join()
-

@@ -5,9 +5,10 @@ import os
 import pickle
 import random
 from random import shuffle
-import json
+
 import numpy as np
 import tensorflow as tf
+
 import params
 
 # Setting-up seeds
@@ -48,17 +49,14 @@ def fix_missing_period(line):
     return line + " ."
 
 
-def get_article_labels_features(sent_file):
-    paper_id = sent_file.split('/')[-1][:-len('.sents.txt')]
+def get_article_labels(sent_file):
     with open(sent_file, 'r') as sentFile:
         sents = sentFile.readlines()
-    with open(sent_file[:-len('.story.txt')] + '.windowed_summarunner_scores.txt', 'r') as labelFile:
-        # with open(sent_file[:-len('.story.txt')] + '.summarunner_scores.txt', 'r') as labelFile:
+    # with open(sent_file[:-len('.story.txt')] + '.windowed_summarunner_scores.txt', 'r') as labelFile:
+    with open(sent_file[:-len('.story.txt')] + '.summarunner_scores.txt', 'r') as labelFile:
         labels = labelFile.readlines()
         labels = [int(label) for label in labels]
-    with open('../../slide_generator_data/data/'+paper_id+'/grobid/sections.features.json') as featureFile:
-        features = json.load(featureFile)
-    return sents, labels, features
+    return sents, labels
 
 
 def article2ids(article_words, vocab):
@@ -87,7 +85,7 @@ def article2ids(article_words, vocab):
 
 def summary2ids(summary_words, vocab, article_oovs):
     """
-		This function converts the given summary words to ID's
+	This function converts the given summary words to ID's
 	:param summary_words: summary tokens.
 	:param vocab: The vocabulary object used for lookup tables, vocabulary etc.
 	:param article_oovs: OOV tokens in the input article.
@@ -127,8 +125,8 @@ def summary2ids(summary_words, vocab, article_oovs):
 
 
 class Vocab(object):
-    def __init__(self, max_vocab_size, emb_dim=300, dataset_path='../data/', glove_path='../glove.6B/glove.6B.50d.txt',
-                 vocab_path='../data_files/vocab.txt', lookup_path='../data_files/lookup.pkl'):
+    def __init__(self, max_vocab_size, emb_dim=300, dataset_path='data/', glove_path='glove.6B/glove.6B.50d.txt',
+                 vocab_path='data_files/vocab.txt', lookup_path='data_files/lookup.pkl'):
 
         self.max_size = max_vocab_size
         self._dim = emb_dim
@@ -305,17 +303,17 @@ class DataGenerator(object):
     def __init__(self, path_to_dataset, max_inp_seq_len, max_out_seq_len, vocab, use_pgen=False, use_sample=False):
         # Train files.
 
-        self.train_files = glob.glob('../data/train/*.sents.txt')
+        self.train_files = glob.glob('data/train/*.sents.txt')
         self.num_train_examples = len(self.train_files)
         shuffle(self.train_files)
 
         # Validation files.
-        self.val_files = glob.glob('../data/val/*.sents.txt')
+        self.val_files = glob.glob('data/val/*.sents.txt')
         self.num_val_examples = len(self.val_files)
         shuffle(self.val_files)
 
         # Test files.
-        self.test_files = glob.glob('../data/test/*.sents.txt')
+        self.test_files = glob.glob('data/test/*.sents.txt')
         self.num_test_examples = len(self.test_files)
         # shuffle(self.test_files)
 
@@ -358,21 +356,18 @@ class DataGenerator(object):
             shuffle(files)
         enc_inp = []
         dec_inp = []
-        feat_inp = []
+        # dec_out = []
 
         for point in range(params.batch_size):
             if self.ptr >= num_examples:
                 break
-            article, labels, features = get_article_labels_features(files[self.ptr])
+            article, labels = get_article_labels(files[self.ptr])
 
             if len(article) > params.doc_size:
                 article = article[:params.doc_size]
-                features = features[:params.doc_size]
-                labels = labels[: params.doc_size]
             elif len(article) < params.doc_size:
                 article = article + [''] * (params.doc_size - len(article))
-                features += (params.doc_size-len(features)) * [[0.0] * len(features[0])]
-                labels += (params.doc_size - len(labels)) * [params.PAD_Label]
+
             enc_inputs = []
             for i, sent_inp_tokens in enumerate(article):
                 sent_inp_tokens = sent_inp_tokens.split()
@@ -386,45 +381,59 @@ class DataGenerator(object):
                 sent_inp_ids = [self.vocab.word2id(w) for w in sent_inp_tokens]  # Word to ID's
                 enc_inputs.append(sent_inp_ids)
 
+            # doc size
+            if len(labels) > params.doc_size:  # Truncate.
+                labels = labels[: params.doc_size]
+
+            # Decoder Input
+            dec_inp_labels = labels
+            if len(dec_inp_labels) < params.doc_size:
+                dec_inp_labels += (params.doc_size - len(dec_inp_labels)) * [params.PAD_Label]
+
             if len(enc_inputs) != len(labels):
                 raise ValueError('The # of sentences and labels are not equal.')
 
             enc_inp.append(enc_inputs)
             dec_inp.append(labels)
-            feat_inp.append(features)
+            # dec_out.append(labels)
+
             self.ptr += 1
 
         enc_inp_np = np.array(enc_inp).astype(np.int32)
         dec_inp_np = np.array(dec_inp).astype(np.int32)
-        feat_inp_np = np.array(feat_inp).astype(np.float)
+        # dec_out_np = np.array(dec_out).astype(np.int32)
+
+        if enc_inp_np.shape[0] != params.batch_size:
+            enc_inp_np = np.concatenate([enc_inp_np, np.zeros(
+                [params.batch_size - enc_inp_np.shape[0], params.doc_size, enc_inp_np.shape[-1]])], axis=0)
+            dec_inp_np = np.concatenate(
+                [dec_inp_np, np.zeros([params.batch_size - dec_inp_np.shape[0], params.doc_size])], axis=0)
+        # dec_out_np = np.concatenate([dec_out_np, np.zeros([params.batch_size-dec_inp_np.shape[0],params.doc_size])], axis=0)
 
         # Resetting the pointer after the last batch
         if self.ptr == num_examples:
             self.ptr = 0
-        batch = [enc_inp_np, dec_inp_np, feat_inp_np]
+        batch = [enc_inp_np, dec_inp_np]
         return batch
 
     def get_test_batch(self):
         num_examples = self.num_test_examples
         files = self.test_files[:]
+
         enc_inp = []
         dec_inp = []
-        feat_inp = []
-        file_names = []
-
+        filenames = []
         for point in range(params.batch_size):
             if self.ptr >= num_examples:
                 break
-            article, labels, features = get_article_labels_features(files[self.ptr])
-            file_names.append(files[self.ptr])
+            article, labels = get_article_labels(files[self.ptr])
+            filenames.append(files[self.ptr])
+
             if len(article) > params.doc_size:
                 article = article[:params.doc_size]
-                features = features[:params.doc_size]
-                labels = labels[: params.doc_size]
             elif len(article) < params.doc_size:
                 article = article + [''] * (params.doc_size - len(article))
-                features += (params.doc_size - len(features)) * [[0.0] * len(features[0])]
-                labels += (params.doc_size - len(labels)) * [params.PAD_Label]
+
             enc_inputs = []
             for i, sent_inp_tokens in enumerate(article):
                 sent_inp_tokens = sent_inp_tokens.split()
@@ -438,27 +447,37 @@ class DataGenerator(object):
                 sent_inp_ids = [self.vocab.word2id(w) for w in sent_inp_tokens]  # Word to ID's
                 enc_inputs.append(sent_inp_ids)
 
+            # doc size
+            if len(labels) > params.doc_size:  # Truncate.
+                labels = labels[: params.doc_size]
+
+            # Decoder Input
+            dec_inp_labels = labels
+            if len(dec_inp_labels) < params.doc_size:
+                dec_inp_labels += (params.doc_size - len(dec_inp_labels)) * [params.PAD_Label]
+
             if len(enc_inputs) != len(labels):
                 raise ValueError('The # of sentences and labels are not equal.')
 
             enc_inp.append(enc_inputs)
             dec_inp.append(labels)
-            feat_inp.append(features)
+
             self.ptr += 1
 
         enc_inp_np = np.array(enc_inp).astype(np.int32)
         dec_inp_np = np.array(dec_inp).astype(np.int32)
-        feat_inp_np = np.array(feat_inp).astype(np.float)
 
-        if enc_inp_np.shape[0] < params.batch_size:
-            enc_inp_np = np.pad(enc_inp_np, pad_width=((0, params.batch_size - enc_inp_np.shape[0]), (0, 0), (0, 0)), mode='constant', constant_values=0)
-            dec_inp_np = np.pad(dec_inp_np, pad_width=((0, params.batch_size - dec_inp_np.shape[0]), (0, 0)), mode='constant', constant_values=0)
-            feat_inp_np = np.pad(feat_inp_np, pad_width=((0, params.batch_size - feat_inp_np.shape[0]), (0, 0), (0, 0)), mode='constant', constant_values=0)
+        if enc_inp_np.shape[0] != params.batch_size:
+            enc_inp_np = np.concatenate([enc_inp_np, np.zeros(
+                [params.batch_size - enc_inp_np.shape[0], params.doc_size, enc_inp_np.shape[-1]])], axis=0)
+            dec_inp_np = np.concatenate(
+                [dec_inp_np, np.zeros([params.batch_size - dec_inp_np.shape[0], params.doc_size])], axis=0)
+
         # Resetting the pointer after the last batch
         if self.ptr == num_examples:
             self.ptr = 0
-        batch = [enc_inp_np, dec_inp_np, feat_inp_np]
-        return batch, file_names
+        batch = [enc_inp_np, dec_inp_np]
+        return batch, filenames
 
     def get_batch(self, split='train'):
         if split == 'train' or split == 'val':
